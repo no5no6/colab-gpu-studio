@@ -5,9 +5,9 @@ import {
   type ActivationInput, type ComputeSpec, type GalleryAsset, type GpuWorkflow, type WorkflowActivation,
 } from '../lib/gpu-api';
 import {
-  activationSmokeParams, appendActivationLog, getActivationStep, getSmokeRuntimeMinutes, hasExistingSmoke,
-  isSmokeCompleted, isSmokePolling, missingActivationInputs, shouldAcceptSmoke, shouldCreateSmoke, smokeIdempotencyKey,
-  terminalSmokeJobId, type ActivationWatch,
+  activationSmokeParams, appendActivationLog, clearSmokeIdempotencyKey, getActivationStep, getSmokeRuntimeMinutes,
+  hasExistingSmoke, isSmokeCompleted, isSmokeFailed, isSmokePolling, missingActivationInputs, shouldAcceptSmoke,
+  shouldCreateSmoke, smokeIdempotencyKey, terminalSmokeJobId, type ActivationWatch,
 } from '../lib/activation-resume';
 import { resolveGpuCheckRequest, selectEligibleColabGpuSpec } from '../lib/colab-check';
 import styles from '../gpu.module.css';
@@ -157,6 +157,9 @@ export function WorkflowActivationPanel({
           const minutes = getSmokeRuntimeMinutes(snapshot);
           say(minutes === null ? '正在提交真实 GPU 冒烟…' : `正在提交真实 GPU 冒烟，最长 ${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)} 分钟`, token);
           const smokeBody = activationSmokeParams(required, inputs);
+          if (isSmokeFailed(snapshot)) {
+            clearSmokeIdempotencyKey(workflow.id, projectId, smokeBody.assetIds);
+          }
           await realSmokeGpuWorkflow(
             workflow.id,
             {

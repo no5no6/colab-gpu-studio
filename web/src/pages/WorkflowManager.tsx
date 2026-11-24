@@ -4,7 +4,7 @@ import type { GpuWorkflow } from '../lib/gpu-api';
 import { Pager } from '../components/ui';
 import { WorkflowActivationPanel } from '../components/WorkflowActivation';
 import { WorkflowGraphPreview, type WorkflowGraphPreviewData } from '../components/WorkflowGraphPreview';
-import { readActivationWatch, writeActivationWatch, type ActivationWatch } from '../lib/activation-resume';
+import { isActiveSmokeState, readActivationWatch, writeActivationWatch, type ActivationWatch } from '../lib/activation-resume';
 import { workflowSearchText, workflowTitle, workflowUsage } from '../lib/workflow-copy';
 import styles from '../gpu.module.css';
 import { workflowState } from '../lib/ui-helpers';
@@ -122,7 +122,7 @@ export function WorkflowsPanel({
             const isOpen = openKeys.has(g.key);
             const all = showAll.has(g.key);
             const shown = all ? g.items : g.items.slice(0, VERSIONS_SHOWN);
-            const activeWatch = g.items.map((item) => watch[item.id]).find((item) => item && ['queued', 'running', 'pending'].includes(item.state.toLowerCase()));
+            const activeWatch = g.items.map((item) => watch[item.id]).find((item) => item && isActiveSmokeState(item.state));
             return (
               <article className={styles.wfGroup} key={g.key} data-open={isOpen}>
                 <button type="button" className={styles.wfGroupHead} aria-expanded={isOpen} onClick={() => toggle(openKeys, setOpenKeys, g.key)}>
@@ -155,7 +155,7 @@ export function WorkflowsPanel({
                             <button className="button secondary small" type="button" onClick={() => setPreviewing(wf)}>离线预览</button>
                             {!published && (
                               <button className="button small" type="button" onClick={() => setActivating(activating === wf.id ? null : wf.id)}>
-                                {activating === wf.id ? '收起启用向导' : watch[wf.id] && ['queued', 'running', 'pending'].includes(watch[wf.id].state.toLowerCase()) ? '查看启用进度' : '一键启用'}
+                                {activating === wf.id ? '收起启用向导' : watch[wf.id] && isActiveSmokeState(watch[wf.id].state) ? '查看启用进度' : '一键启用'}
                               </button>
                             )}
                             {!published && <button className="button secondary small" type="button" onClick={() => onValidate(wf)}>校验</button>}

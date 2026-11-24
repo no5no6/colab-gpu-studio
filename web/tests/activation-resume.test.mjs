@@ -3,13 +3,16 @@ import assert from 'node:assert/strict';
 
 import {
   appendActivationLog,
+  clearSmokeIdempotencyKey,
   getActivationStep,
   getSmokeRuntimeMinutes,
   hasExistingSmoke,
   isSmokeCompleted,
+  isSmokeFailed,
   isSmokePolling,
   shouldCreateSmoke,
   shouldAcceptSmoke,
+  smokeIdempotencyKey,
   terminalSmokeJobId,
 } from '../src/lib/activation-resume.ts';
 
@@ -31,8 +34,21 @@ test('step decisions always use the refreshed activation snapshot', () => {
   assert.equal(getActivationStep(next, 'real_smoke')?.done, false);
 });
 
-test('queued and running smoke jobs are resumable and must not create another job', () => {
-  for (const state of ['queued', 'running']) {
+test('all active in-flight smoke states are resumable and must not create another job', () => {
+  const activeStates = [
+    'pending',
+    'queued',
+    'validating',
+    'waiting_for_capacity',
+    'allocating',
+    'preparing',
+    'loading',
+    'running',
+    'uploading',
+    'cleaning_up',
+    'cleanup_pending',
+  ];
+  for (const state of activeStates) {
     const current = snapshot({ smoke: { job_id: `job-${state}`, state } });
     assert.equal(hasExistingSmoke(current), true);
     assert.equal(isSmokePolling(current), true);
@@ -55,9 +71,35 @@ test('completed smoke is accepted directly without creating a paid job', () => {
 test('failed smoke is not treated as a resumable completed task', () => {
   const current = snapshot({ smoke: { job_id: 'job-failed', state: 'failed' } });
 
+  assert.equal(isSmokeFailed(current), true);
   assert.equal(hasExistingSmoke(current), false);
   assert.equal(shouldCreateSmoke(current), true);
   assert.equal(shouldAcceptSmoke(current), false);
+});
+
+test('smoke idempotency key is reused for uncertain submissions and rotated after failure', () => {
+  const backing = new Map();
+  const original = globalThis.sessionStorage;
+  globalThis.sessionStorage = {
+    getItem: (key) => (backing.has(key) ? backing.get(key) : null),
+    setItem: (key, value) => { backing.set(key, String(value)); },
+    removeItem: (key) => { backing.delete(key); },
+  };
+  try {
+    const first = smokeIdempotencyKey('wf-1', 'proj-1', ['b', 'a']);
+    const same = smokeIdempotencyKey('wf-1', 'proj-1', ['a', 'b']);
+    assert.equal(same, first);
+
+    assert.equal(isSmokeFailed(snapshot({ smoke: null })), false);
+    assert.equal(isSmokeFailed(snapshot({ smoke: { job_id: 'job-1', state: 'failed' } })), true);
+
+    clearSmokeIdempotencyKey('wf-1', 'proj-1', ['a', 'b']);
+    const rotated = smokeIdempotencyKey('wf-1', 'proj-1', ['a', 'b']);
+    assert.notEqual(rotated, first);
+  } finally {
+    if (original === undefined) delete globalThis.sessionStorage;
+    else globalThis.sessionStorage = original;
+  }
 });
 
 test('terminal smoke snapshots expose the persisted task for detail/log opening', () => {

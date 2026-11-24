@@ -22,9 +22,26 @@ export type ActivationResumeSnapshot = {
   [key: string]: unknown;
 };
 
-const ACTIVE_SMOKE_STATES = new Set(['pending', 'queued', 'running']);
+const ACTIVE_SMOKE_STATES = new Set([
+  'pending',
+  'queued',
+  'validating',
+  'waiting_for_capacity',
+  'allocating',
+  'preparing',
+  'loading',
+  'running',
+  'uploading',
+  'cleaning_up',
+  'cleanup_pending',
+]);
 const COMPLETED_SMOKE_STATES = new Set(['completed', 'succeeded', 'success']);
 const FAILED_SMOKE_STATES = new Set(['failed', 'cancelled', 'canceled', 'error']);
+
+/** 判断冒烟任务状态是否仍处于进行中的活跃态 */
+export function isActiveSmokeState(state: string | null | undefined): boolean {
+  return ACTIVE_SMOKE_STATES.has(String(state || '').toLowerCase());
+}
 
 export function getActivationStep(
   snapshot: ActivationResumeSnapshot | null | undefined,
@@ -47,6 +64,11 @@ export function isSmokePolling(snapshot: ActivationResumeSnapshot | null | undef
 
 export function isSmokeCompleted(snapshot: ActivationResumeSnapshot | null | undefined): boolean {
   return Boolean(snapshot?.smoke_job_completed) || COMPLETED_SMOKE_STATES.has(smokeState(snapshot));
+}
+
+/** 冒烟任务是否处于失败或取消终态，用于重试前轮换幂等键 */
+export function isSmokeFailed(snapshot: ActivationResumeSnapshot | null | undefined): boolean {
+  return Boolean(smokeJobId(snapshot)) && FAILED_SMOKE_STATES.has(smokeState(snapshot));
 }
 
 /** A job that can be resumed or accepted; failed jobs may be retried as a new smoke. */
@@ -141,9 +163,20 @@ export function writeActivationWatch(value: Record<string, ActivationWatch>): vo
   try { sessionStorage.setItem(WATCH_KEY, JSON.stringify(value)); } catch { /* storage can be unavailable */ }
 }
 
-export function smokeIdempotencyKey(workflowId: string, projectId: string, assetIds: string[]): string {
+function smokeStorageKey(workflowId: string, projectId: string, assetIds: string[]): string {
   const signature = `${workflowId}:${projectId}:${[...assetIds].sort().join(',')}`;
-  const storageKey = `studio-smoke-idem:${signature}`;
+  return `studio-smoke-idem:${signature}`;
+}
+
+/** 清除已失败冒烟的幂等键，避免重试继续命中旧失败任务 */
+export function clearSmokeIdempotencyKey(workflowId: string, projectId: string, assetIds: string[]): void {
+  try {
+    sessionStorage.removeItem(smokeStorageKey(workflowId, projectId, assetIds));
+  } catch { /* storage can be unavailable */ }
+}
+
+export function smokeIdempotencyKey(workflowId: string, projectId: string, assetIds: string[]): string {
+  const storageKey = smokeStorageKey(workflowId, projectId, assetIds);
   try {
     const existing = sessionStorage.getItem(storageKey);
     if (existing) return existing;

@@ -475,3 +475,114 @@ def test_complete_legacy_snapshot_remains_reusable():
         {"model_id": workflow["model_id"], "revision": REVISION},
         current,
     ) is True
+
+
+def test_real_smoke_prefers_manifest_compute_spec_over_wizard_request(monkeypatch):
+    st = Store("sqlite:///:memory:")
+    repo = Repository(st)
+    workflow = setup_workflow(repo)
+    manifest = dict(workflow["manifest"])
+    manifest["compute_spec"] = {"variant": "GPU", "accelerator": "T4", "shape": "STANDARD"}
+    repo.update("workflows", workflow["id"], {"manifest": manifest}, OWNER["id"])
+    st.create("projects", OWNER["id"], {"title": "p"}, record_id="project-1")
+    repo.create("accounts", OWNER["id"], {"enabled": True, "allow_allocation": True}, record_id="account-1")
+    enable_fake_real_smoke(monkeypatch)
+    monkeypatch.setattr(
+        review_routes.GoogleColabProvider,
+        "list_specs",
+        lambda self: [
+            {"eligible": True, "key": {"variant": "GPU", "accelerator": "A100", "shape": "STANDARD"}},
+            {"eligible": True, "key": {"variant": "GPU", "accelerator": "T4", "shape": "STANDARD"}},
+        ],
+    )
+
+    payload = smoke_body(workflow["id"], "ignored", "prefer-manifest")
+    payload["spec"] = {"key": {"variant": "GPU", "accelerator": "A100", "shape": "STANDARD"}}
+    created = body(
+        review_routes.real_smoke(
+            workflow["id"],
+            payload,
+            request({"Idempotency-Key": "smoke-manifest-spec"}),
+            OWNER,
+            st,
+        )
+    )
+
+    job = repo.get("jobs", created["job_id"], OWNER["id"])
+    assert job["requested_spec"]["key"] == {"variant": "GPU", "accelerator": "T4", "shape": "STANDARD"}
+
+
+def test_active_intermediate_smoke_states_are_reused_and_ranked_over_failed(monkeypatch):
+    for active_state in (
+        "validating",
+        "waiting_for_capacity",
+        "allocating",
+        "preparing",
+        "loading",
+        "uploading",
+        "cleaning_up",
+        "cleanup_pending",
+    ):
+        st = Store("sqlite:///:memory:")
+        repo = Repository(st)
+        workflow = setup_workflow(repo)
+        st.create("projects", OWNER["id"], {"title": "p"}, record_id="project-1")
+        repo.create("accounts", OWNER["id"], {"enabled": True, "allow_allocation": True}, record_id="account-1")
+        enable_fake_real_smoke(monkeypatch)
+
+        first = body(
+            review_routes.real_smoke(
+                workflow["id"],
+                smoke_body(workflow["id"], "ignored", f"active-{active_state}"),
+                request({"Idempotency-Key": f"smoke-active-{active_state}"}),
+                OWNER,
+                st,
+            )
+        )
+        repo.update("jobs", first["job_id"], {"state": active_state}, OWNER["id"])
+
+        # 插入一条更新时间更晚的失败任务，验证活跃中间态不会被失败记录遮挡。
+        failed_job, _ = repo.create_job(
+            OWNER["id"],
+            {
+                "project_id": "project-1",
+                "workflow_id": workflow["id"],
+                "execution_policy": {"provider": "google_colab"},
+            },
+            f"smoke-failed-{active_state}",
+        )
+        active_job = repo.get("jobs", first["job_id"], OWNER["id"])
+        repo.update(
+            "jobs",
+            failed_job["id"],
+            {
+                "state": "failed",
+                "target_workflow_id": workflow["id"],
+                "target_model_id": workflow["model_id"],
+                "workflow_key": workflow["workflow_key"],
+                "workflow_version": workflow["workflow_version"],
+                "smoke_compatibility_signature": active_job["smoke_compatibility_signature"],
+                "snapshot": active_job["snapshot"],
+            },
+            OWNER["id"],
+        )
+
+        activation = body(review_routes.workflow_activation(workflow["id"], request(), OWNER, st))
+        assert activation["smoke"]["job_id"] == first["job_id"]
+        assert activation["smoke"]["state"] == active_state
+        assert activation["smoke"]["acceptance_state"] == "pending"
+        assert activation["smoke"]["reusable"] is True
+        smoke_step = next(step for step in activation["steps"] if step["key"] == "real_smoke")
+        assert smoke_step["running"] is True
+
+        resumed = body(
+            review_routes.real_smoke(
+                workflow["id"],
+                smoke_body(workflow["id"], "ignored", f"retry-{active_state}"),
+                request({"Idempotency-Key": f"smoke-retry-{active_state}"}),
+                OWNER,
+                st,
+            )
+        )
+        assert resumed["job_id"] == first["job_id"]
+        assert resumed["resumed"] is True

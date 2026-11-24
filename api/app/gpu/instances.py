@@ -158,6 +158,9 @@ class InstanceService:
 
     def _requested(self, job, name):
         policy = self._job_policy(job)
+        if name == "account_id" and self._provider(job) == "mock" and "requested_account_id" in job:
+            # 自动选择的模拟任务不把迁移回填的账号当成显式选择。
+            return job["requested_account_id"] or policy.get("requested_account_id") or policy.get("account_id")
         return job.get(f"requested_{name}") or job.get(name) or policy.get(f"requested_{name}") or policy.get(name)
 
     def _attempt_key(self, job):

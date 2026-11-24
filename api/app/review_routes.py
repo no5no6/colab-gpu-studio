@@ -29,7 +29,7 @@ from .gpu.rates import estimate as estimate_units
 from .gpu.rates import mode_param
 from .gpu.repository import Repository
 from .gpu.runtime_worker import REVIEWED_CUSTOM_NODES, _reviewed_custom_nodes, _validate_weights
-from .gpu.scheduler import Scheduler
+from .gpu.scheduler import ACTIVE_STATES, Scheduler
 from .storage import read_asset
 
 router = APIRouter(prefix="/api/gpu")
@@ -502,7 +502,7 @@ def _job_matches_smoke(job: Mapping, workflow_id: str, row: Mapping, model: Mapp
 
 def _reusable_smoke_job(repo: Repository, owner: str, workflow_id: str, row: Mapping, model: Mapping, signature: str):
     for job in repo.list("jobs", owner):
-        if job.get("state") not in {"queued", "running", "completed"}:
+        if job.get("state") != "completed" and job.get("state") not in ACTIVE_STATES:
             continue
         if job.get("smoke_accepted") is True:
             continue
@@ -700,8 +700,10 @@ def real_smoke(
     google = GoogleService(repo, user["id"], account_id=account_id)
     if not google.status().get("colab", {}).get("connected"):
         raise APIError("GOOGLE_NOT_CONNECTED", "请先完成个人Colab OAuth授权")
+    # 冒烟优先验证工作流锁定的机型，避免向导的通用选卡覆盖实际需求。
+    smoke_spec_key = row["manifest"].get("compute_spec") or requested_key
     chosen_spec = _eligible_spec(
-        GoogleColabProvider(repo, user["id"], account_id=account_id).list_specs(), requested_key
+        GoogleColabProvider(repo, user["id"], account_id=account_id).list_specs(), smoke_spec_key
     )
     # 大模型要先下载权重；声明值仍受服务端全局上限约束。冒烟上限与步骤标签、任务记录使用同一个数。
     estimated = runtime * cfg.unit_rate  # budget worst case
@@ -1038,8 +1040,12 @@ def workflow_activation(
             and row.get("smoke_test_kind") == "real"
             and row.get("smoke_test_passed") is True
         )
-        states = {"completed": 1, "running": 2, "queued": 3, "failed": 4, "cancelled": 5}
-        return 0 if accepted else states.get(job.get("state"), 6)
+        if accepted:
+            return 0
+        state = job.get("state")
+        if state in ACTIVE_STATES:
+            return 3 if state == "queued" else 2
+        return {"completed": 1, "failed": 4, "cancelled": 5}.get(state, 6)
 
     # Prefer a successful pending artifact over a newer failed retry.  The
     # second stable sort keeps the newest job within the same lifecycle state.
@@ -1069,7 +1075,7 @@ def workflow_activation(
             smoke_acceptance_state = "published" if published else "accepted"
         elif smoke_completed:
             smoke_acceptance_state = "pending"
-        elif smoke_state in {"queued", "running"}:
+        elif smoke_state in ACTIVE_STATES:
             smoke_acceptance_state = "pending"
         else:
             smoke_acceptance_state = "failed"
@@ -1093,7 +1099,7 @@ def workflow_activation(
             "key": "real_smoke",
             "label": "真实 GPU 冒烟" if runtime_cap is None else f"真实 GPU 冒烟（≤{runtime_cap} 分钟）",
             "done": smoke_done or smoke_completed,
-            "running": smoke_state in {"queued", "running"},
+            "running": smoke_state in ACTIVE_STATES,
             "failed": smoke_state == "failed",
         },
         {"key": "accept_smoke", "label": "验收冒烟结果", "done": smoke_done},
@@ -1134,7 +1140,7 @@ def workflow_activation(
                 "error_message": smoke.get("error_message"),
                 "acceptance_state": smoke_acceptance_state,
                 "max_runtime_minutes": smoke.get("max_runtime_minutes") or runtime_cap,
-                "reusable": bool(smoke_state in {"queued", "running", "completed"} and not smoke_accepted),
+                "reusable": bool((smoke_state == "completed" or smoke_state in ACTIVE_STATES) and not smoke_accepted),
             },
             "required_inputs": activation_inputs(row.get("manifest")),
             "smoke_job_completed": smoke_completed,

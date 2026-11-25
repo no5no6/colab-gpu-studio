@@ -37,6 +37,22 @@ test('settings uses account directory and compute uses instance center', () => {
   assert.doesNotMatch(compute, /GoogleOAuthSetup/);
 });
 
+test('instance center defaults to active tab without redundant all filter', () => {
+  const source = read('components/InstanceCenter.tsx');
+  assert.match(source, /type Filter = 'active' \| 'retained' \| 'history';/);
+  assert.match(source, /useState<Filter>\('active'\)/);
+  assert.doesNotMatch(source, /\['all', '全部'\]/);
+});
+
+test('workflow activation surfaces allocation readiness and keeps the run button responsive', () => {
+  const source = read('components/WorkflowActivation.tsx');
+  assert.match(source, /未勾选「允许分配」/);
+  assert.match(source, /allowAllocation/);
+  assert.match(source, /上次真实冒烟失败/);
+  assert.match(source, /disabled=\{busy \|\| !specsLoaded\}/);
+  assert.match(source, /say\(`失败：\$\{message\}`/);
+});
+
 test('App wires retention success back into the instance state without duplicates', () => {
   const source = read('App.tsx');
   assert.match(source, /const updatedInstance = await apiFetch<GpuInstance>\(/);

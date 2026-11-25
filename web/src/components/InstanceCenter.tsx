@@ -7,7 +7,7 @@ import { formatInstanceTime as formatTime } from '../lib/instance-time';
 import { gpuLabel } from '../lib/gpu-label';
 import styles from './v020.module.css';
 
-type Filter = 'all' | 'active' | 'retained' | 'history';
+type Filter = 'active' | 'retained' | 'history';
 type Action = 'retain' | 'stop';
 type Detail = GpuInstance & {
   jobs?: Array<Record<string, unknown>>;
@@ -55,12 +55,12 @@ function stateLabel(value?: string): string {
   } as Record<string, string>)[String(value || '')] || value || '状态未知';
 }
 
-function isHistory(instance: GpuInstance): boolean {
-  return ['deleted', 'unknown', 'cleanup_pending', 'quarantined'].includes(String(instance.state || '').toLowerCase());
-}
-
 function isActive(instance: GpuInstance): boolean {
   return ['requested', 'allocating', 'ready', 'busy', 'retained_idle', 'releasing'].includes(String(instance.state || '').toLowerCase());
+}
+
+function isHistory(instance: GpuInstance): boolean {
+  return !isActive(instance);
 }
 
 function errorText(cause: unknown): string {
@@ -68,7 +68,7 @@ function errorText(cause: unknown): string {
 }
 
 export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, onRefresh }: InstanceCenterProps) {
-  const [filter, setFilter] = useState<Filter>('all');
+  const [filter, setFilter] = useState<Filter>('active');
   const [selectedId, setSelectedId] = useState('');
   const [detail, setDetail] = useState<Detail | null>(null);
   const [workbench, setWorkbench] = useState<GpuInstance | null>(null);
@@ -96,13 +96,13 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
     }
   }, [rows, selectedId]);
 
-  const activeCount = rows.filter((instance) => isActive(instance) && !isHistory(instance)).length;
-  const retainedCount = rows.filter((instance) => instance.state === 'retained_idle').length;
+  const activeCount = rows.filter((instance) => isActive(instance)).length;
+  const retainedCount = rows.filter((instance) => isActive(instance) && (instance.state === 'retained_idle' || instance.retained_until != null)).length;
+  const historyCount = rows.filter((instance) => isHistory(instance)).length;
   const filtered = rows.filter((instance) => {
-    if (filter === 'active') return isActive(instance) && !isHistory(instance);
-    if (filter === 'retained') return instance.state === 'retained_idle' || instance.retained_until != null;
-    if (filter === 'history') return isHistory(instance);
-    return true;
+    if (filter === 'active') return isActive(instance);
+    if (filter === 'retained') return isActive(instance) && (instance.state === 'retained_idle' || instance.retained_until != null);
+    return isHistory(instance);
   });
 
   function keyFor(action: Action, id: string) {
@@ -184,13 +184,13 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
     {status && <p className={styles.status} role="status">{status}</p>}
     {error && <p className={styles.error} role="alert">{error}</p>}
     <div className={styles.summaryRow} aria-label="实例统计">
-      <div className={styles.summaryCell}><span className={styles.muted}>全部</span><b>{rows.length}</b></div>
       <div className={styles.summaryCell}><span className={styles.muted}>活动</span><b>{activeCount}</b></div>
       <div className={styles.summaryCell}><span className={styles.muted}>保留</span><b>{retainedCount}</b></div>
+      <div className={styles.summaryCell}><span className={styles.muted}>历史</span><b>{historyCount}</b></div>
     </div>
     <div className={styles.toolbar}>
       <div className={styles.filterGroup} role="group" aria-label="实例筛选">
-        {([['all', '全部'], ['active', '活动'], ['retained', '保留'], ['history', '历史']] as const).map(([value, text]) => <button key={value} type="button" className={styles.filterButton} aria-pressed={filter === value} onClick={() => setFilter(value)}>{text}</button>)}
+        {([['active', '活动'], ['retained', '保留'], ['history', '历史']] as const).map(([value, text]) => <button key={value} type="button" className={styles.filterButton} aria-pressed={filter === value} onClick={() => setFilter(value)}>{text}</button>)}
       </div>
     </div>
     {!filtered.length ? <div className={styles.empty}><strong>{rows.length ? '当前筛选没有实例' : '还没有实例'}</strong><span>{rows.length ? '切换筛选查看其他状态。' : '提交任务后，服务端分配的实例会显示在这里。'}</span></div> : <div className={styles.instanceMeta}>

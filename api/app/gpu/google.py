@@ -118,7 +118,11 @@ class GoogleService:
         if row.get("id") == config_id(owner_id, default_id):
             return False  # Newly saved dedicated apps are never legacy-shared.
         default = self.store.get("accounts", default_id, owner_id)
-        return bool(default and (default.get("legacy_default") is True or default.get("legacy_trusted") is True))
+        return bool(
+            default
+            and not default.get("archived_at")
+            and (default.get("legacy_default") is True or default.get("legacy_trusted") is True)
+        )
 
     def _client_config(self, owner_id: str | None = None, account_id: str | None = None) -> dict | None:
         owner = self.owner_id if owner_id is None else owner_id

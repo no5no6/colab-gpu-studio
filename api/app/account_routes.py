@@ -103,6 +103,23 @@ def update_account(
     return _invoke(request, action)
 
 
+@router.delete("/{account_id}")
+def delete_account(
+    account_id: str,
+    body: dict | None = None,
+    request: Request = None,
+    user=Depends(get_current_user_for_tests),
+):
+    def action():
+        key = _idempotency(request)
+        payload = body or {}
+        if payload.get("confirmed") is not True:
+            raise APIError("CONFIRMATION_REQUIRED", "删除账号必须明确确认", 403)
+        return ok(_service(request, user).archive(account_id, key, payload), request)
+
+    return _invoke(request, action)
+
+
 @router.post("/{account_id}/auth/{purpose}/start")
 def start_account_auth(
     account_id: str,

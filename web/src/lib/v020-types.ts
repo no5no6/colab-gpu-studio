@@ -46,6 +46,8 @@ export interface GoogleAccount {
   alias: string;
   state: GoogleAccountState;
   enabled: boolean;
+  /** 是否允许新任务分配该账号的 GPU */
+  allow_allocation?: boolean;
   email_masked?: string | null;
   drive_account_id?: string | null;
   drive_account_alias?: string | null;
@@ -74,6 +76,8 @@ export interface GoogleAccountCreateRequest {
 export interface GoogleAccountUpdateRequest {
   alias?: string;
   enabled?: boolean;
+  /** 是否允许新任务分配该账号的 GPU；关闭后真实任务会被准入拒绝 */
+  allow_allocation?: boolean;
   drive_account_id?: string | null;
   allowed_project_ids?: string[];
   scheduling_policy?: string;

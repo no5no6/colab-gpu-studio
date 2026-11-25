@@ -45,7 +45,8 @@ def _resource(repo, kind, resource_id, user, code, message):
 def _account_is_usable(account: dict) -> bool:
     status = str(account.get("status", account.get("state", "connected"))).lower()
     return (
-        account.get("enabled", True) is not False
+        not account.get("archived_at")
+        and account.get("enabled", True) is not False
         and account.get("disabled", False) is not True
         and account.get("allow_allocation", True) is not False
         and status not in {"disabled", "needs_reauth", "error", "revoked"}

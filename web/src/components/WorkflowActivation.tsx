@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   acceptGpuWorkflowSmoke, apiMessage, getGpuComputeSpecs, getGoogleAccounts, getReferenceAssets, getWorkflowActivation,
-  publishGpuWorkflow, realSmokeGpuWorkflow, reviewGpuModel, reviewGpuWorkflow, uploadAsset, validateGpuWorkflow, getGpuJob,
+  publishGpuWorkflow, realSmokeGpuWorkflow, reviewGpuModel, reviewGpuWorkflow, updateGoogleAccount, uploadAsset, validateGpuWorkflow, getGpuJob,
   type ActivationInput, type ComputeSpec, type GalleryAsset, type GpuWorkflow, type WorkflowActivation,
 } from '../lib/gpu-api';
 import {
@@ -9,11 +9,17 @@ import {
   hasExistingSmoke, isSmokeCompleted, isSmokeFailed, isSmokePolling, missingActivationInputs, shouldAcceptSmoke,
   shouldCreateSmoke, smokeIdempotencyKey, terminalSmokeJobId, type ActivationWatch,
 } from '../lib/activation-resume';
-import { resolveGpuCheckRequest, selectEligibleColabGpuSpec } from '../lib/colab-check';
+import { isColabAccountQueryable, isColabAccountUsable, resolveGpuCheckRequest, selectEligibleColabGpuSpec } from '../lib/colab-check';
+import { jobStageLabel } from '../lib/job-stage-rows';
 import styles from '../gpu.module.css';
 import { JobHistoryDetails, type JobHistoryDetailRecord } from './JobHistoryDetails';
 
 const STEPS_POLL_MS = 6000;
+
+type RuntimeChoice =
+  | { ok: true; accountId: string; spec: ComputeSpec }
+  | { ok: false; reason: string; account?: { id: string; alias: string } }
+  | null;
 
 const sleep = (ms: number) => new Promise((resolve) => { window.setTimeout(resolve, ms); });
 
@@ -52,15 +58,17 @@ export function WorkflowActivationPanel({
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [consent, setConsent] = useState(false);
-  const [accountId, setAccountId] = useState('');
-  const [spec, setSpec] = useState<ComputeSpec | null>(null);
   const [specsLoaded, setSpecsLoaded] = useState(false);
+  const [readiness, setReadiness] = useState('');
+  const [allocationTarget, setAllocationTarget] = useState<{ id: string; alias: string } | null>(null);
+  const [enablingAllocation, setEnablingAllocation] = useState(false);
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [assets, setAssets] = useState<GalleryAsset[]>([]);
   const [uploading, setUploading] = useState('');
   const aliveRef = useRef(false);
   const executionRef = useRef(0);
   const runningRef = useRef(false);
+  const allocationKeyRef = useRef<Record<string, string>>({});
   const fileRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const onWatchRef = useRef(onWatch);
   onWatchRef.current = onWatch;
@@ -78,18 +86,67 @@ export function WorkflowActivationPanel({
     return next;
   }, [isCurrent, workflow.id]);
 
+  const loadRuntime = useCallback(async (snapshot: WorkflowActivation, token: number): Promise<RuntimeChoice> => {
+    const accounts = await getGoogleAccounts();
+    if (!isCurrent(token)) return null;
+    const usable = accounts.filter((account) => isColabAccountUsable(account));
+    if (!usable.length) {
+      const connected = accounts.filter((account) => isColabAccountQueryable(account));
+      if (connected.length) {
+        const target = connected[0];
+        const alias = target.alias || target.account_id.slice(0, 8);
+        return {
+          ok: false,
+          reason: `账号「${alias}」已连接 Colab，但未勾选「允许分配」，无法启动真实 GPU 任务。`,
+          account: { id: target.account_id, alias },
+        };
+      }
+      return { ok: false, reason: '没有已启用且已连接 Colab 的账号，请先到 设置 → Google 账号 完成 Colab 授权。' };
+    }
+    const request = resolveGpuCheckRequest(
+      { real_enabled: snapshot.real_enabled, offline_mode: false },
+      accounts,
+      null,
+      true,
+    );
+    if (request.provider !== 'colab') {
+      return { ok: false, reason: '没有可用于分配的 Colab 账号。' };
+    }
+    const eligible = selectEligibleColabGpuSpec(await getGpuComputeSpecs('colab', request.accountId));
+    if (!isCurrent(token)) return null;
+    if (!eligible) {
+      return { ok: false, reason: '当前账号没有可用的真实 GPU 规格（已过滤 CPU/TPU）。' };
+    }
+    return { ok: true, accountId: request.accountId, spec: eligible };
+  }, [isCurrent]);
+
   const waitForSmoke = useCallback(async (
     initial: WorkflowActivation,
     token: number,
   ): Promise<WorkflowActivation | null> => {
     let snapshot = initial;
     let announcedState = '';
+    let announcedStage = '';
     const minutes = getSmokeRuntimeMinutes(snapshot);
     while (isCurrent(token)) {
       const state = String(snapshot.smoke?.state || '').toLowerCase();
       if (state && state !== announcedState) {
         announcedState = state;
         say(smokeStateText(state, minutes), token);
+      }
+      const jobId = snapshot.smoke?.job_id;
+      if (jobId) {
+        try {
+          const job = await getGpuJob(jobId);
+          if (!isCurrent(token)) return null;
+          const stage = String(job.stage || '');
+          if (stage && stage !== announcedStage) {
+            announcedStage = stage;
+            say(`当前阶段：${jobStageLabel(stage)}`, token);
+          }
+        } catch {
+          // 阶段信息是辅助展示，读取失败不能中断冒烟轮询。
+        }
       }
       if (isSmokeCompleted(snapshot) || ['failed', 'cancelled', 'canceled', 'error'].includes(state)) {
         return snapshot;
@@ -153,7 +210,16 @@ export function WorkflowActivationPanel({
           if (missing.length) throw new Error(`请先上传：${missing.join('、')}`);
           if (!consent) throw new Error('请先确认会真实开 GPU 并产生费用');
           if (!projectId) throw new Error('请先在顶栏选择项目。冒烟只会记在当前项目里，不会自动改用别的项目。');
-          if (!accountId || !spec) throw new Error('当前账号没有可用的 GPU 规格，请先授权 Colab');
+          say('正在检查 Google 账号与 GPU 规格…', token);
+          const runtime = await loadRuntime(snapshot, token);
+          if (!runtime) return;
+          if (!runtime.ok) {
+            setReadiness(runtime.reason);
+            setAllocationTarget(runtime.account || null);
+            throw new Error(runtime.reason);
+          }
+          setReadiness('');
+          setAllocationTarget(null);
           const minutes = getSmokeRuntimeMinutes(snapshot);
           say(minutes === null ? '正在提交真实 GPU 冒烟…' : `正在提交真实 GPU 冒烟，最长 ${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)} 分钟`, token);
           const smokeBody = activationSmokeParams(required, inputs);
@@ -167,8 +233,8 @@ export function WorkflowActivationPanel({
               project_id: projectId,
               params: smokeBody.params,
               asset_ids: smokeBody.assetIds,
-              account_id: accountId,
-              spec,
+              account_id: runtime.accountId,
+              spec: runtime.spec,
             },
             smokeIdempotencyKey(workflow.id, projectId, smokeBody.assetIds),
           );
@@ -201,18 +267,23 @@ export function WorkflowActivationPanel({
       say('完成，可以回创作页用了', token);
       onDone();
     } catch (err) {
-      if (isCurrent(token)) setError(apiMessage(err));
+      if (isCurrent(token)) {
+        const message = apiMessage(err);
+        setError(message);
+        say(`失败：${message}`, token);
+      }
     } finally {
       runningRef.current = false;
       if (isCurrent(token)) setBusy(false);
     }
-  }, [accountId, busy, consent, inputs, isCurrent, onDone, projectId, refresh, say, spec, waitForSmoke, workflow.id]);
+  }, [busy, consent, inputs, isCurrent, loadRuntime, onDone, projectId, refresh, say, waitForSmoke, workflow.id]);
 
   useEffect(() => {
     aliveRef.current = true;
     const token = executionRef.current + 1;
     executionRef.current = token;
     const load = async () => {
+      setError('');
       try {
         const snapshot = await refresh(token);
         if (!isCurrent(token)) return;
@@ -228,21 +299,15 @@ export function WorkflowActivationPanel({
           }
           return;
         }
-        const accounts = await getGoogleAccounts();
-        if (!isCurrent(token)) return;
-        const request = resolveGpuCheckRequest(
-          { real_enabled: snapshot.real_enabled, offline_mode: false },
-          accounts,
-          null,
-        );
-        if (request.provider !== 'colab') {
-          throw new Error('没有已启用且已连接 Colab 的账号，无法读取真实 GPU 规格');
+        const runtime = await loadRuntime(snapshot, token);
+        if (!runtime) return;
+        if (!runtime.ok) {
+          setReadiness(runtime.reason);
+          setAllocationTarget(runtime.account || null);
+          return;
         }
-        const eligible = selectEligibleColabGpuSpec(await getGpuComputeSpecs('colab', request.accountId));
-        if (!isCurrent(token)) return;
-        if (!eligible) throw new Error('当前账号没有可用的真实 GPU 规格（已过滤 CPU/TPU）');
-        setAccountId(request.accountId);
-        setSpec(eligible);
+        setReadiness('');
+        setAllocationTarget(null);
       } catch (err) {
         if (isCurrent(token)) setError(apiMessage(err));
       } finally {
@@ -254,7 +319,7 @@ export function WorkflowActivationPanel({
       aliveRef.current = false;
       executionRef.current += 1;
     };
-  }, [isCurrent, refresh, say, waitForSmoke]);
+  }, [isCurrent, loadRuntime, refresh, say, waitForSmoke]);
 
   useEffect(() => {
     if (!projectId) {
@@ -293,6 +358,46 @@ export function WorkflowActivationPanel({
   const smokeProjectId = data?.smoke?.project_id || '';
   const smokeElsewhere = Boolean(existingSmoke && smokeProjectId && projectId && smokeProjectId !== projectId);
 
+  async function allowAllocation() {
+    if (!allocationTarget || enablingAllocation) return;
+    const token = executionRef.current;
+    const previousReadiness = readiness;
+    setEnablingAllocation(true);
+    setError('');
+    setReadiness('正在允许该账号分配 GPU…');
+    try {
+      const key = allocationKeyRef.current[allocationTarget.id]
+        || `activation-allow-${allocationTarget.id}-${Date.now()}`;
+      allocationKeyRef.current[allocationTarget.id] = key;
+      await updateGoogleAccount(
+        allocationTarget.id,
+        { allow_allocation: true },
+        key,
+      );
+      delete allocationKeyRef.current[allocationTarget.id];
+      if (!isCurrent(token)) return;
+      const snapshot = await refresh(token);
+      if (!isCurrent(token)) return;
+      const runtime = await loadRuntime(snapshot, token);
+      if (!runtime) return;
+      if (!runtime.ok) {
+        setReadiness(runtime.reason);
+        setAllocationTarget(runtime.account || null);
+        return;
+      }
+      setReadiness('');
+      setAllocationTarget(null);
+      say('已允许该账号分配 GPU，可以继续启用。', token);
+    } catch (err) {
+      if (isCurrent(token)) {
+        setReadiness(previousReadiness);
+        setError(apiMessage(err));
+      }
+    } finally {
+      if (isCurrent(token)) setEnablingAllocation(false);
+    }
+  }
+
   async function uploadFor(input: ActivationInput, file: File) {
     if (!projectId) {
       setError('请先在顶栏选择项目，再上传图片。');
@@ -330,6 +435,21 @@ export function WorkflowActivationPanel({
       {data?.blockers.length && !existingSmoke ? (
         <div className={styles.notice}>
           {data.blockers.map((item) => <p key={item} className="small">{item}</p>)}
+        </div>
+      ) : null}
+      {data?.smoke?.state === 'failed' && data.smoke.error_message ? (
+        <div className={styles.notice}>
+          <p className="small">上次真实冒烟失败：{data.smoke.error_message}{data.smoke.error_code ? `（${data.smoke.error_code}）` : ''}</p>
+        </div>
+      ) : null}
+      {readiness ? (
+        <div className={styles.notice}>
+          <p className="small">{readiness}</p>
+          {allocationTarget ? (
+            <button className="button secondary small" type="button" disabled={enablingAllocation} onClick={() => void allowAllocation()}>
+              {enablingAllocation ? '处理中…' : '允许该账号分配并继续'}
+            </button>
+          ) : null}
         </div>
       ) : null}
       {needsNewSmoke && requiredInputs.length ? (
@@ -409,10 +529,10 @@ export function WorkflowActivationPanel({
         <button
           className="button"
           type="button"
-          disabled={busy || !specsLoaded || (needsNewSmoke && (!consent || missing.length > 0 || !projectId))}
+          disabled={busy || !specsLoaded}
           onClick={() => void runAll()}
         >
-          {busy ? '执行中…' : data?.done ? '重新检查' : existingSmoke ? '继续验收并启用' : '一键跑通并启用'}
+          {busy ? '执行中…' : !specsLoaded ? '读取规格中…' : data?.done ? '重新检查' : existingSmoke ? '继续验收并启用' : readiness ? '重新检查并继续' : '一键跑通并启用'}
         </button>
         <button className="button secondary" type="button" onClick={() => {
           executionRef.current += 1;

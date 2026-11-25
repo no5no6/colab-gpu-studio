@@ -562,6 +562,8 @@ export default function App() {
         const decision = resolveInstanceSubmission(runtimeChoice, instances);
         setRuntimeChoice({ ...runtimeChoice, accountId: decision.accountId || runtimeChoice.accountId, instanceId: null });
         setError('所选 GPU 机器已释放或不能复用。这次没有提交任务，也没有换账号。请再点一次确认，改为自动分配，或另选一台可用机器。');
+      } else if (code === 'REAL_LIFECYCLE_UNVERIFIED') {
+        setError('真实 GPU 的「智能 / 保留」还没完成真机验证。请把「任务完成后的策略」改为「节省：任务结束后释放」，再点一次立即生成。');
       } else if (code === 'NETWORK_TIMEOUT') {
         setError(`提交任务：${apiMessage(cause)}。网络中断时请先到「任务」页确认是否已经提交，不要连续改参数重试。`);
       } else {
@@ -693,6 +695,7 @@ export default function App() {
   function changeRuntimeChoice(next: RuntimeChoice) {
     setRuntimeChoice(next);
     setBatchMode(next.lifecycle);
+    setError('');
   }
 
   function openInstanceWorkbench(instance: GpuInstance) {
@@ -838,7 +841,7 @@ export default function App() {
             onRuntimeChoiceChange={changeRuntimeChoice}
             loading={loading}
             error={error}
-            onSubmit={() => setConfirm('submit')}
+            onSubmit={() => { setError(''); setConfirm('submit'); }}
             onApplyPreset={applyPreset}
             onSavePreset={(name) => void savePreset(name)}
           />

@@ -229,7 +229,7 @@ def tick_ccu(repo, owner_id: str, *, sampler=None, now: float | None = None) -> 
 
     for account in repo.list("accounts", owner_id):
         account_id = account.get("account_id")
-        if not account_id or account.get("enabled") is False:
+        if not account_id or account.get("enabled") is False or account.get("archived_at"):
             continue
         if account.get("provider", "colab") != "colab":
             continue

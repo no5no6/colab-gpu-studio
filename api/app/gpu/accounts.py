@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import uuid
 from typing import Any
 
@@ -49,6 +50,7 @@ class AccountService:
     ACTIVE_INSTANCE_STATES = frozenset(
         {"requested", "allocating", "ready", "busy", "retained_idle", "releasing", "unknown", "cleanup_pending", "quarantined"}
     )
+    TERMINAL_JOB_STATES = frozenset({"completed", "failed", "cancelled", "expired", "succeeded"})
 
     def __init__(self, repo, owner_id: str):
         if repo is None or not isinstance(owner_id, str) or not owner_id:
@@ -71,6 +73,11 @@ class AccountService:
     def _get(self, account_id: str) -> dict | None:
         # Account records use the account id as their row id.
         return self.repo.get("accounts", account_id, self.owner_id)
+
+    @staticmethod
+    def _archived(row: dict | None) -> bool:
+        """账号是否已归档；归档行保留历史关联但不再出现在目录中。"""
+        return bool(row and row.get("archived_at"))
 
     def _operation(self, key: str | None, body: Any) -> dict | None:
         if not key:
@@ -157,7 +164,7 @@ class AccountService:
             return None, None
         self._ensure_default()
         target = self._get(target_id)
-        if not target:
+        if not target or self._archived(target):
             raise APIError("NOT_FOUND", "绑定的Drive账号不存在或不属于当前用户", 404)
         resolved_id = str(target.get("account_id") or target.get("id"))
         if target.get("drive_account_id"):
@@ -178,7 +185,7 @@ class AccountService:
         delegated = row.get("drive_account_id")
         if isinstance(delegated, str) and delegated.strip() and delegated.strip() != account_id:
             target = self._get(delegated.strip())
-            if target:
+            if target and not self._archived(target):
                 return str(target.get("account_id") or target.get("id"))
         return account_id
 
@@ -190,7 +197,7 @@ class AccountService:
         drive_alias = None
         if isinstance(drive_account_id, str) and drive_account_id.strip() and drive_account_id.strip() != account_id:
             target = self._get(drive_account_id.strip())
-            if target:
+            if target and not self._archived(target):
                 target_id = str(target.get("account_id") or target.get("id"))
                 drive_alias = self._clean_text(target.get("alias"), 80, "主账号")
                 target_drive = GoogleService(self.repo, self.owner_id, account_id=target_id).status().get("drive") or {}
@@ -244,12 +251,12 @@ class AccountService:
 
     def list(self) -> list[dict]:
         self._ensure_default()
-        return [self._public(row) for row in self._rows("accounts")]
+        return [self._public(row) for row in self._rows("accounts") if not self._archived(row)]
 
     def require(self, account_id: str) -> dict:
         self._ensure_default()
         row = self._get(account_id)
-        if not row:
+        if not row or self._archived(row):
             raise APIError("NOT_FOUND", "Google账号不存在或不属于当前用户", 404)
         return row
 
@@ -341,6 +348,91 @@ class AccountService:
                 remote_confirmed = False
         result = {"account_id": account_id, "disconnected": remote_confirmed, "remote_confirmed": remote_confirmed, "status": "confirmed" if remote_confirmed else "remote_unconfirmed"}
         return self._save_operation(idempotency_key, body, result, operation="disconnect")
+
+    def _active_resources(self, account_id: str) -> list[str]:
+        """列出仍占用该账号的活动实例、租约和任务，用于阻止归档。"""
+        resources: list[str] = []
+        for item in self._rows("instances"):
+            if item.get("account_id") == account_id and item.get("state") in self.ACTIVE_INSTANCE_STATES:
+                resources.append(f"实例 {item.get('id')}")
+        for item in self._rows("leases"):
+            if item.get("account_id") == account_id and item.get("state") not in {None, "deleted", "released"}:
+                resources.append(f"租约 {item.get('id')}")
+        for item in self._rows("jobs"):
+            if item.get("account_id") == account_id and item.get("state") not in self.TERMINAL_JOB_STATES:
+                resources.append(f"任务 {item.get('id')}")
+        return resources
+
+    def archive(self, account_id: str, idempotency_key: str | None = None, body: dict | None = None) -> dict:
+        """软删除账号：撤销授权、隐藏目录项，但保留历史任务和作品引用。"""
+        body = {"account_id": account_id, **(body or {})}
+        existing = self._operation(idempotency_key, body)
+        if existing is not None:
+            return existing
+        self.require(account_id)
+        active = self._active_resources(account_id)
+        if active:
+            raise APIError(
+                "ACCOUNT_HAS_ACTIVE_RESOURCES",
+                f"账号仍有 {len(active)} 个活动资源，请先停止并确认收尾后再删除",
+                409,
+            )
+        dependents = [
+            row
+            for row in self._rows("accounts")
+            if not self._archived(row)
+            and row.get("account_id") != account_id
+            and row.get("drive_account_id") == account_id
+        ]
+        if dependents:
+            raise APIError(
+                "ACCOUNT_USED_AS_DRIVE",
+                f"仍有 {len(dependents)} 个账号复用该账号的 Drive，请先切换存储来源",
+                409,
+            )
+        credential_rows = [row for row in self._rows("credentials") if row.get("account_id") == account_id]
+        live = [row for row in credential_rows if not row.get("revoked")]
+        remote_confirmed = True
+        if live and os.getenv("STUDIO_OFFLINE_TEST") != "1":
+            from .google import GoogleService
+
+            service = GoogleService(self.repo, self.owner_id, account_id=account_id)
+            for purpose in ("colab", "drive"):
+                if any(item.get("purpose") == purpose for item in live) and not service.disconnect(purpose):
+                    remote_confirmed = False
+        elif live:
+            for credential in live:
+                self.repo.update(
+                    "credentials",
+                    credential["id"],
+                    {
+                        "revoked": True,
+                        "encrypted_access_token": None,
+                        "encrypted_refresh_token": None,
+                        "disconnect_status": "offline_unconfirmed",
+                    },
+                    self.owner_id,
+                )
+        archived_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.repo.update(
+            "accounts",
+            account_id,
+            {
+                "archived_at": archived_at,
+                "enabled": False,
+                "allow_allocation": False,
+                "drive_account_id": None,
+            },
+            self.owner_id,
+        )
+        result = {
+            "account_id": account_id,
+            "deleted": True,
+            "archived": True,
+            "remote_confirmed": remote_confirmed,
+            "status": "archived",
+        }
+        return self._save_operation(idempotency_key, body, result, operation="archive")
 
     def runtimes(self, account_id: str) -> list[dict]:
         self.require(account_id)

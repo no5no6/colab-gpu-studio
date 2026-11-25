@@ -273,6 +273,11 @@ export const updateGoogleAccount = (accountId: string, body: GoogleAccountUpdate
   apiFetch<GoogleAccount>(`/api/gpu/accounts/${encodeURIComponent(accountId)}`, write('PATCH', body, idempotencyKey));
 export const disconnectGoogleAccount = (accountId: string, idempotencyKey: string) =>
   apiFetch<GoogleAccount>(`/api/gpu/accounts/${encodeURIComponent(accountId)}/disconnect`, write('POST', {}, idempotencyKey));
+export const deleteGoogleAccount = (accountId: string, idempotencyKey: string) =>
+  apiFetch<{ account_id: string; deleted: boolean; archived: boolean }>(
+    `/api/gpu/accounts/${encodeURIComponent(accountId)}`,
+    { method: 'DELETE', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify({ confirmed: true }) },
+  );
 export const startGoogleAccountAuth = (accountId: string, purpose: GoogleAuthPurpose, idempotencyKey: string) =>
   apiFetch<{ authorization_url: string; state?: string }>(
     `/api/gpu/accounts/${encodeURIComponent(accountId)}/auth/${purpose}/start`,
@@ -312,6 +317,7 @@ export const getAccounts = getGoogleAccounts;
 export const createAccount = createGoogleAccount;
 export const updateAccount = updateGoogleAccount;
 export const disconnectAccount = disconnectGoogleAccount;
+export const deleteAccount = deleteGoogleAccount;
 export const startAccountAuth = startGoogleAccountAuth;
 export const listInstances = listGpuInstances;
 export const getInstance = getGpuInstance;

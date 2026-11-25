@@ -136,6 +136,40 @@ def test_account_service_whitelist_default_migration_and_disconnect_guard():
         service.disconnect(account["account_id"])
 
 
+def test_account_archive_hides_and_guards_active_resources(monkeypatch):
+    monkeypatch.setenv("STUDIO_OFFLINE_TEST", "1")
+    repo = MemoryRepo()
+    service = AccountService(repo, "owner-1")
+    account = service.create({"alias": "旧账号"})
+    account_id = account["account_id"]
+    job = repo.create("jobs", "owner-1", {"account_id": account_id, "state": "queued"})
+    with pytest.raises(APIError, match="活动资源"):
+        service.archive(account_id, "archive-active", {"confirmed": True})
+    repo.update("jobs", job["id"], {"state": "completed"}, "owner-1")
+    result = service.archive(account_id, "archive-one", {"confirmed": True})
+    assert result["deleted"] is True
+    assert result["archived"] is True
+    assert all(row["account_id"] != account_id for row in service.list())
+    with pytest.raises(APIError, match="不存在"):
+        service.require(account_id)
+    assert service.archive(account_id, "archive-one", {"confirmed": True}) == result
+
+
+def test_archived_legacy_default_is_not_recreated(monkeypatch):
+    monkeypatch.setenv("STUDIO_OFFLINE_TEST", "1")
+    repo = MemoryRepo()
+    repo.create(
+        "credentials",
+        "owner-1",
+        {"provider": "google", "purpose": "drive", "encrypted_access_token": "x", "encrypted_refresh_token": "y"},
+    )
+    service = AccountService(repo, "owner-1")
+    default_id = service.list()[0]["account_id"]
+    service.archive(default_id, "archive-default", {"confirmed": True})
+    assert service.list() == []
+    assert repo.get("accounts", default_id, "owner-1")["archived_at"]
+
+
 def test_account_route_requires_idempotency_and_is_idempotent():
     from app.account_routes import router
 
@@ -156,3 +190,12 @@ def test_account_route_requires_idempotency_and_is_idempotent():
     assert first.json()["data"]["account_id"] == second.json()["data"]["account_id"]
     conflict = client.post("/api/gpu/accounts", headers=headers, json={"alias": "two"})
     assert conflict.status_code == 409
+    account_id = first.json()["data"]["account_id"]
+    delete_headers = {"Idempotency-Key": "delete-one"}
+    unconfirmed = client.request("DELETE", f"/api/gpu/accounts/{account_id}", headers=delete_headers, json={})
+    assert unconfirmed.status_code == 403
+    deleted = client.request("DELETE", f"/api/gpu/accounts/{account_id}", headers=delete_headers, json={"confirmed": True})
+    assert deleted.status_code == 200
+    assert deleted.json()["data"]["archived"] is True
+    listed = client.get("/api/gpu/accounts")
+    assert all(row["account_id"] != account_id for row in listed.json()["data"])

@@ -178,6 +178,8 @@ class InstanceService:
         if row.owner_id != owner_id:
             return False
         data = self._data(row)
+        if data.get("archived_at"):
+            return False
         status = self._value(data, "auth_status", "status", "connection_status", default="connected")
         connected = self._value(data, "connected", default=status == "connected")
         if connected is not True or data.get("enabled", True) is not True or data.get("allow_allocation", True) is not True:
@@ -195,6 +197,8 @@ class InstanceService:
         account_id = f"mock-{uuid.uuid5(uuid.NAMESPACE_URL, f'colab-gpu-mock-account:{owner_id}').hex}"
         existing = session.scalar(select(model).where(model.id == account_id))
         if existing:
+            if self._data(existing).get("archived_at"):
+                raise AllocationError("模拟账号已删除，请先连接真实 Google 账号")
             return existing
         now = self._utcnow()
         payload = {

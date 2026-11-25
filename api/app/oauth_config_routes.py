@@ -97,7 +97,11 @@ def _trusted_legacy_default(repo: Repository, owner_id: str, row: dict) -> bool:
     if row.get("id") == config_id(owner_id, default_id):
         return False
     account = repo.get("accounts", default_id, owner_id)
-    return bool(account and (account.get("legacy_default") is True or account.get("legacy_trusted") is True))
+    return bool(
+        account
+        and not account.get("archived_at")
+        and (account.get("legacy_default") is True or account.get("legacy_trusted") is True)
+    )
 
 
 def _effective_config(repo: Repository, owner_id: str, rows: list[dict], account_id: str | None) -> dict | None:

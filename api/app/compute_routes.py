@@ -19,12 +19,12 @@ def _require_account(repo, owner_id: str, account_id: str | None, *, require_all
     if not isinstance(account_id, str):
         raise APIError("ACCOUNT_INVALID", "account_id必须为字符串", 422)
     account = repo.get("accounts", account_id, owner_id)
-    if not account:
+    if not account or account.get("archived_at"):
         raise APIError("ACCOUNT_NOT_FOUND", "指定的Google账号不存在或不属于当前用户", 404)
     if account.get("enabled", True) is False or account.get("disabled", False) is True:
         raise APIError("ACCOUNT_DISABLED", "指定的Google账号已停用", 409)
     if require_allocation and account.get("allow_allocation", True) is False:
-        raise APIError("ACCOUNT_UNAVAILABLE", "指定账号不允许分配GPU", 409)
+        raise APIError("ACCOUNT_UNAVAILABLE", "指定账号未勾选「允许分配」，不能启动 GPU 任务", 409)
     if account.get("authorized", account.get("connected", True)) is False:
         raise APIError("ACCOUNT_UNAUTHORIZED", "指定账号尚未完成授权", 409)
     return account

@@ -54,6 +54,7 @@ export function CreatePanel({
   selectedAssets, setSelectedAssets, uploadProgress, onUpload, setModelId, workflowId, setWorkflowId,
   runtime, setRuntime, maxRuntime, setMaxRuntime, batchCount, setBatchCount, batchMode,
   runtimeChoice, accounts, instances, onRuntimeChoiceChange,
+  autoRetryOnCapacity = false, onAutoRetryChange,
   loading, error, onSubmit, onApplyPreset, onSavePreset,
 }: {
   projectId: string;
@@ -85,6 +86,10 @@ export function CreatePanel({
   accounts: GpuAccount[];
   instances: GpuInstance[];
   onRuntimeChoiceChange: (value: RuntimeChoice) => void;
+  /** 是否在 Colab 无空闲显卡时自动重试 */
+  autoRetryOnCapacity?: boolean;
+  /** 切换无空闲显卡自动重试开关 */
+  onAutoRetryChange?: (enabled: boolean) => void;
   loading: string;
   error: string;
   onSubmit: () => void;
@@ -354,6 +359,22 @@ export function CreatePanel({
             <input id="max-runtime" type="number" inputMode="numeric" min={5} max={maxMinutesCap} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
             <span className={styles.hint}>超时会被强制关机，已花的 CU 不退。</span>
           </div>
+        )}
+        {runtime === 'colab' && onAutoRetryChange && (
+          <label className={styles.switchRow} htmlFor="auto-retry-capacity">
+            <span className={styles.switchText}>
+              <strong>无空闲显卡时自动重试</strong>
+              <small>遇到 Colab 无空闲卡（NO_RUNTIMES）时自动间隔抢卡，点击「取消」立即停止。</small>
+            </span>
+            <input
+              id="auto-retry-capacity"
+              className={styles.switchControl}
+              type="checkbox"
+              role="switch"
+              checked={autoRetryOnCapacity}
+              onChange={(e) => onAutoRetryChange(e.target.checked)}
+            />
+          </label>
         )}
         <p className="muted small">
           {runtime === 'mock' ? RUNTIME_HELP.mock : `${RUNTIME_HELP.colab}今日限额 ${shown(settings?.budget?.daily_units)} CU。`}

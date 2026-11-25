@@ -122,6 +122,11 @@ function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
 const PROJECT_KEY = 'colab-gpu-studio-project';
 function savedProjectId(): string { try { return localStorage.getItem(PROJECT_KEY) || ''; } catch { return ''; } }
 function saveProjectId(id: string) { try { if (id) localStorage.setItem(PROJECT_KEY, id); } catch { /* storage can be unavailable */ } }
+const AUTO_RETRY_KEY = 'colab-gpu-studio-auto-retry-capacity';
+/** 读取本地记住的无空闲显卡自动重试开关状态 */
+function savedAutoRetry(): boolean { try { return localStorage.getItem(AUTO_RETRY_KEY) === '1'; } catch { return false; } }
+/** 持久化无空闲显卡自动重试开关状态 */
+function saveAutoRetry(enabled: boolean) { try { localStorage.setItem(AUTO_RETRY_KEY, enabled ? '1' : '0'); } catch { /* storage can be unavailable */ } }
 
 function ProjectSheet({
   open,
@@ -239,6 +244,8 @@ export default function App() {
   const [batchCount,setBatchCount] = useState(1);
   const [batchMode,setBatchMode] = useState<'save'|'smart'|'batch'|'retain'>('save');
   const [runtimeChoice, setRuntimeChoice] = useState<RuntimeChoice>({ accountId: '', instanceId: '', lifecycle: 'save', retainIdleMinutes: 15 });
+  /** 是否开启无空闲显卡自动重试 */
+  const [autoRetryOnCapacity, setAutoRetryOnCapacity] = useState<boolean>(savedAutoRetry);
   const [accounts, setAccounts] = useState<GpuAccount[]>([]);
   const [instances, setInstances] = useState<GpuInstance[]>([]);
   const [resourceError, setResourceError] = useState('');
@@ -542,6 +549,7 @@ export default function App() {
           instance_id: decision.instanceId,
           lifecycle: runtimeChoice.lifecycle,
           retain_idle_minutes: runtimeChoice.retainIdleMinutes,
+          ...(runtime === 'colab' && autoRetryOnCapacity ? { auto_retry_on_capacity: true } : {}),
         },
       };
       if (runtime === 'mock' || batchCount > 1) {
@@ -698,6 +706,12 @@ export default function App() {
     setError('');
   }
 
+  /** 切换无空闲显卡自动重试并同步到本地存储 */
+  function changeAutoRetryOnCapacity(enabled: boolean) {
+    setAutoRetryOnCapacity(enabled);
+    saveAutoRetry(enabled);
+  }
+
   function openInstanceWorkbench(instance: GpuInstance) {
     const id = instanceIdOf(instance);
     if (!id) return;
@@ -734,7 +748,12 @@ export default function App() {
         return next;
       });
       setJobs((current) => current.map((item) => item.instance_id === instanceId
-        ? { ...item, lifecycle: 'retain', retained_until: updatedInstance.retained_until, instance_state: updatedInstance.state }
+        ? {
+          ...item,
+          lifecycle: 'retain',
+          retained_until: updatedInstance.retained_until ?? updatedInstance.idle_deadline_at ?? null,
+          instance_state: updatedInstance.state,
+        }
         : item));
       await refreshJobs();
     });
@@ -839,6 +858,8 @@ export default function App() {
             accounts={accounts}
             instances={instances}
             onRuntimeChoiceChange={changeRuntimeChoice}
+            autoRetryOnCapacity={autoRetryOnCapacity}
+            onAutoRetryChange={changeAutoRetryOnCapacity}
             loading={loading}
             error={error}
             onSubmit={() => { setError(''); setConfirm('submit'); }}
@@ -852,6 +873,8 @@ export default function App() {
             jobs={jobs}
             error={jobError}
             refreshing={refreshingJobs}
+            autoRetryOnCapacity={autoRetryOnCapacity}
+            onAutoRetryChange={changeAutoRetryOnCapacity}
             onRefresh={() => void refreshJobs()}
             onCancel={(id) => void action('cancel', async () => { await cancelGpuJob(id); await refreshJobs(); })}
             onRetry={(id) => void action('retry', async () => {
@@ -859,7 +882,7 @@ export default function App() {
               const key = retryKeys.current[id] || `attempt:${id}:${keyId()}`;
               retryKeys.current[id] = key;
               if (job?.provider === 'mock') await retryGpuAttempt(id, key);
-              else await retryGpuJob(id, key);
+              else await retryGpuJob(id, key, { auto_retry_on_capacity: autoRetryOnCapacity });
               delete retryKeys.current[id];
               await refreshJobs();
             })}
@@ -972,6 +995,7 @@ export default function App() {
               <dt>机器</dt><dd>{resolveInstanceSubmission(runtimeChoice, instances).machineLabel}</dd>
               <dt>数量</dt><dd>{batchCount}</dd>
               {runtime === 'colab' && <><dt>最长运行</dt><dd>{maxRuntime} 分钟</dd></>}
+              {runtime === 'colab' && <><dt>无卡自动重试</dt><dd>{autoRetryOnCapacity ? '已开启（点取消后停止）' : '未开启'}</dd></>}
             </dl>
             {error && <p className="status error" role="alert">{error}</p>}
             <div className="actions">

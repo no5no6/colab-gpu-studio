@@ -58,11 +58,19 @@ def public_job(job):
         "gpu_reported",
         "retained_until",
         "selection_reason",
+        "capacity_retry_count",
+        "capacity_retry_at",
+        "capacity_retry_message",
     }
     result = {k: v for k, v in job.items() if k in keys}
     result["job_id"] = job["id"]
+    if result.get("retained_until") is None and job.get("idle_deadline_at") is not None:
+        result["retained_until"] = job["idle_deadline_at"]
     result["mock"] = job.get("provider") == "mock"
     result["workflow_smoke"] = job.get("workflow_smoke") is True or (job.get("snapshot") or {}).get("workflow_smoke") is True
+    result["auto_retry_on_capacity"] = bool(
+        (job.get("execution_policy") or {}).get("auto_retry_on_capacity") or job.get("auto_retry_on_capacity")
+    )
     result["resolved_params"] = (job.get("snapshot") or {}).get("resolved_params", {})
     # The requested Colab spec is shown separately from the GPU the worker actually measured.
     requested = (job.get("requested_spec") or (job.get("execution_policy") or {}).get("requested_spec")

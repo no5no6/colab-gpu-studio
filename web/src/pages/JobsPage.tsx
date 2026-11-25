@@ -3,6 +3,7 @@ import { Zap, Search, RefreshCw, Image as ImageIcon, Film, Loader, ChevronRight,
 import { type GpuJob } from '../lib/gpu-api';
 import styles from '../gpu.module.css';
 import { formatDateTime, jobSize, progressPercent, readableState, terminalStates } from '../lib/ui-helpers';
+import { formatInstanceTime } from '../lib/instance-time';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
 import { canRetainJobInstance, gpuLabel } from '../lib/gpu-label';
 
@@ -15,11 +16,16 @@ const FAILED = ['failed', 'failed_final', 'cancelled', 'cancelled_local', 'block
 type Filter = 'all' | 'running' | 'completed' | string;
 
 export function TasksPanel({
-  jobs, error, refreshing, onRefresh, onCancel, onRetry, onDetail, onRetain, onInstance,
+  jobs, error, refreshing, autoRetryOnCapacity = false, onAutoRetryChange,
+  onRefresh, onCancel, onRetry, onDetail, onRetain, onInstance,
 }: {
   jobs: GpuJob[];
   error: string;
   refreshing: boolean;
+  /** 是否开启无空闲显卡自动重试（应用于重试与新提交任务） */
+  autoRetryOnCapacity?: boolean;
+  /** 切换无空闲显卡自动重试开关 */
+  onAutoRetryChange?: (enabled: boolean) => void;
   onRefresh: () => void;
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
@@ -71,6 +77,24 @@ export function TasksPanel({
 
       {error && <p className="status error" role="alert">{error}</p>}
 
+      {/* 无卡自动重试开关：与创作页同步，方便在任务页一键开关后直接点重试 */}
+      {onAutoRetryChange && (
+        <label className={styles.switchRow} htmlFor="jobs-auto-retry-capacity">
+          <span className={styles.switchText}>
+            <strong>无空闲显卡时自动重试</strong>
+            <small>开启后，新任务或点击「重试」遇到无空闲卡会自动间隔重试；点「取消」立刻停止。</small>
+          </span>
+          <input
+            id="jobs-auto-retry-capacity"
+            className={styles.switchControl}
+            type="checkbox"
+            role="switch"
+            checked={autoRetryOnCapacity}
+            onChange={(e) => onAutoRetryChange(e.target.checked)}
+          />
+        </label>
+      )}
+
       <label className={styles.searchBox}>
         <Search size={17} strokeWidth={1.6} aria-hidden />
         <input aria-label="搜索任务" placeholder="搜索任务（名称、编号）" value={query} onChange={(e) => { setQuery(e.target.value); setLimit(30); }} />
@@ -120,6 +144,9 @@ export function TasksPanel({
             ].filter(Boolean).join(' · ');
             const liveInstance = canRetainJobInstance(job);
             const retained = liveInstance && Boolean(job.retained_until || job.instance_state === 'retained_idle');
+            const retryCount = Number(job.capacity_retry_count || 0);
+            const retryingCapacity = !terminalStates.has(s) && Boolean(job.auto_retry_on_capacity);
+            const retryMessage = typeof job.capacity_retry_message === 'string' ? job.capacity_retry_message : '';
 
             return (
               <article className={styles.jobCard} key={jobKey}>
@@ -130,7 +157,10 @@ export function TasksPanel({
                   <div className={styles.jobInfo}>
                     <div className={styles.jobTitleRow}>
                       <strong title={job.workflow_key || job.id}>{job.workflow_key || `任务 ${job.id.slice(0, 8)}`}</strong>
-                      <span className={`pill ${done ? 'solid' : failed ? 'danger' : ''}`}>{jobStateLabel(job.state)}</span>
+                      <span className={styles.jobPills}>
+                        {retryingCapacity && <span className="pill">{retryCount > 0 ? `自动重试 #${retryCount}` : '自动重试'}</span>}
+                        <span className={`pill ${done ? 'solid' : failed ? 'danger' : ''}`}>{jobStateLabel(job.state)}</span>
+                      </span>
                     </div>
                     <p className="muted small">
                       {[video ? '视频' : '图片', size, job.provider === 'mock' ? '模拟' : job.provider === 'colab' ? 'Colab' : ''].filter(Boolean).join(' · ')}
@@ -144,7 +174,13 @@ export function TasksPanel({
                 {(running || waiting) && (
                   <div className={styles.progressBlock}>
                     <div className={styles.progressText}>
-                      <span>{running ? (job.stage ? jobStageLabel(job.stage) : pct !== null ? `生成中 ${pct}%` : '生成中…') : '排队等待中'}</span>
+                      <span>
+                        {retryMessage && (waiting || s === 'cleaning_up')
+                          ? retryMessage
+                          : running
+                            ? (job.stage ? jobStageLabel(job.stage) : pct !== null ? `生成中 ${pct}%` : '生成中…')
+                            : '排队等待中'}
+                      </span>
                     </div>
                     <div className={styles.progress} data-indeterminate={pct === null}><span style={pct !== null ? { width: `${pct}%` } : undefined} /></div>
                   </div>
@@ -155,10 +191,10 @@ export function TasksPanel({
                 <div className={styles.cardActions}>
                   <button className="button small" style={{ flex: 1 }} type="button" onClick={() => onDetail(job)}>查看详情</button>
                   {liveInstance && !retained && onRetain && <button className="button secondary small" type="button" onClick={() => onRetain(job)}>保留这台机器</button>}
-                  {retained && <span className="pill">已保留{job.retained_until ? `至 ${formatDateTime(String(job.retained_until))}` : ''}</span>}
+                  {retained && <span className="pill">已保留{job.retained_until ? `至 ${formatInstanceTime(job.retained_until)}` : ''}</span>}
                   {!terminalStates.has(s) ? (
                     <button className="button secondary small" style={{ flex: 1 }} type="button" onClick={() => onCancel(job.id)}>
-                      <Square size={13} strokeWidth={1.8} aria-hidden />取消
+                      <Square size={13} strokeWidth={1.8} aria-hidden />{retryCount > 0 ? '停止重试并取消' : '取消'}
                     </button>
                   ) : (
                     <button className="button secondary small" style={{ flex: 1 }} type="button" onClick={() => onRetry(job.id)}>

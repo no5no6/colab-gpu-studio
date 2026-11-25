@@ -23,7 +23,7 @@ class ColabAllocationError(ColabError):
         self.reason = reason
         # Only the numeric code is shown; Google's own text may carry private data.
         if reason == "NO_RUNTIMES":
-            message = "Colab 暂时无法分配运行时（NO_RUNTIMES）；请稍后重试"
+            message = "Colab 上游资源紧缺，当前没有空闲显卡可分配（NO_RUNTIMES）；请稍后重试"
         else:
             message = f"Colab 分配 Operation 失败（code {code}）"
         super().__init__(message)

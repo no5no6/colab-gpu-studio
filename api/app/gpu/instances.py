@@ -55,7 +55,7 @@ class InstanceService:
     _PUBLIC = {
         "id", "owner_id", "project_id", "state", "version", "account_id", "account_alias_snapshot", "provider",
         "instance_label", "runtime_spec_requested", "runtime_spec_reported", "gpu_reported", "current_job_id",
-        "lease_id", "hard_deadline_at", "idle_deadline_at", "retention_mode", "manual_stop_requested",
+        "lease_id", "hard_deadline_at", "idle_deadline_at", "retained_until", "retention_mode", "manual_stop_requested",
         "created_at", "updated_at", "last_seen_at", "generation", "selection_reason", "runtime_deleted",
         "allocation_key", "budget_reserved", "retention_reserved", "allocation_requested_at", "deletion_confirmed_at",
     }
@@ -563,6 +563,9 @@ class InstanceService:
                 minutes = min(30.0, max(1.0, float(minutes)))
                 data["retain_idle_minutes"] = minutes
                 data["idle_deadline_at"] = min(self.clock() + float(minutes) * 60, float(hard)) if hard is not None else self.clock() + float(minutes) * 60
+                data["retained_until"] = data["idle_deadline_at"]
+            else:
+                data["retained_until"] = None
             self._set(instance, data, state=state, session=session)
             self._emit(session, instance.owner_id, instance.project_id, instance.id, job.get("id"), state, "job completed" if success else "job failed")
             return self._dict(instance)
@@ -588,7 +591,11 @@ class InstanceService:
             current = data.get("hard_deadline_at")
             if deadline is not None:
                 deadline = float(deadline)
-                data["hard_deadline_at"] = min(float(current), deadline) if current is not None else deadline
+                # 自动重试分配期间实例尚未就绪，使用新租约的截止时间，避免把等待算力时间计入运行上限。
+                if current is not None and not (instance.state == "allocating" and job.get("capacity_retry_count")):
+                    data["hard_deadline_at"] = min(float(current), deadline)
+                else:
+                    data["hard_deadline_at"] = deadline
             data.update(lease_id=lease_id, current_job_id=job.get("id"), last_seen_at=self.clock())
             self._set(instance, data, state=instance.state, session=session)
             account = self._account_row(session, data.get("account_id"), instance.owner_id)
@@ -671,15 +678,33 @@ class InstanceService:
                 data["retain_idle_minutes"] = minutes
                 deadline = self.clock() + minutes * 60
                 data["idle_deadline_at"] = min(deadline, float(hard)) if hard is not None else deadline
+                data["retained_until"] = data["idle_deadline_at"]
                 data["retention_mode"] = mode
                 # Retention is an explicit lifecycle transition.  The
                 # scheduler may still finish the current job afterwards, but
                 # the durable instance policy is already retained_idle.
                 state = "retained_idle"
             else:
-                data.update(retention_mode="save", idle_deadline_at=None, retention_reserved=0.0)
+                data.update(retention_mode="save", idle_deadline_at=None, retained_until=None, retention_reserved=0.0)
                 state = "releasing" if data.get("current_job_id") is None else instance.state
             self._set(instance, data, state=state, session=session)
+            # 同步保留状态与截止时间到正在关联的任务，避免前端刷新任务列表时把“已保留”覆盖回“保留这台机器”。
+            current_job_id = data.get("current_job_id")
+            if current_job_id:
+                try:
+                    job_row = self._find(session, "jobs", current_job_id, owner)
+                except ValueError:
+                    job_row = None
+                if job_row is not None:
+                    job_data = self._data(job_row)
+                    if job_data.get("instance_id") in {None, id}:
+                        job_data.update(
+                            instance_state=state,
+                            retention_mode=data["retention_mode"],
+                            idle_deadline_at=data.get("idle_deadline_at"),
+                            retained_until=data.get("retained_until"),
+                        )
+                        self._set(job_row, job_data, state=job_row.state, session=session)
             result = self.public(self._dict(instance))
             self._finish_operation(operation, result, session)
             self._emit(session, owner, instance.project_id, id, data.get("current_job_id"), state, "retention updated")

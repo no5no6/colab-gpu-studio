@@ -12,7 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -582,7 +582,13 @@ def cancel_job(job_id: str, request: Request, user=Depends(current_user), st=Dep
 
 
 @router.post("/jobs/{job_id}/retry")
-def retry_job(job_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
+def retry_job(
+    job_id: str,
+    request: Request,
+    body: dict | None = Body(default=None),
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
     original = own(Repository(st), "jobs", job_id, user)
     if original["state"] not in {"failed", "cancelled", "completed"}:
         raise APIError("JOB_ACTIVE", "原任务尚未结束，不能重复提交")
@@ -594,6 +600,9 @@ def retry_job(job_id: str, request: Request, user=Depends(current_user), st=Depe
         raise APIError('SPECIAL_JOB_RETRY_REQUIRED','诊断或预热任务需回到对应入口重新确认',409)
     if original.get('resolved_seed') is not None:
         raw.setdefault('params',{})['seed']=original['resolved_seed']
+    if isinstance(body, dict) and "auto_retry_on_capacity" in body:
+        policy = raw.setdefault("execution_policy", {})
+        policy["auto_retry_on_capacity"] = bool(body["auto_retry_on_capacity"])
     raw['retry_of']=original['id']
     return ok(public_job(admit_job(st, user, raw, key)), request, 202)
 

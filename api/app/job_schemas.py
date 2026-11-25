@@ -14,6 +14,7 @@ _NEW_POLICY_FIELDS = {
     "instance_id",
     "lifecycle",
     "retain_idle_minutes",
+    "auto_retry_on_capacity",
 }
 
 
@@ -40,6 +41,8 @@ class Policy(BaseModel):
     instance_id: str | None = None
     lifecycle: Literal["save", "batch", "smart", "retain"] | None = None
     retain_idle_minutes: int = Field(default=15, ge=1, le=30)
+    # 无空闲 GPU（NO_RUNTIMES）时是否由后端调度器自动间隔重试，直到成功分配或用户取消。
+    auto_retry_on_capacity: bool = False
 
     @field_validator("account_id", "instance_id")
     @classmethod
@@ -97,6 +100,8 @@ def normalize_policy(policy: Policy | dict) -> dict:
         lifecycle=lifecycle,
         retain_idle_minutes=parsed.retain_idle_minutes,
     )
+    if "auto_retry_on_capacity" in parsed.model_fields_set or parsed.auto_retry_on_capacity:
+        data["auto_retry_on_capacity"] = bool(parsed.auto_retry_on_capacity)
     return data
 
 

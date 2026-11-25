@@ -70,3 +70,18 @@ test('jobs render machine history and only expose retention action through callb
   assert.match(source, /onInstance\?:/);
   assert.match(source, /key=\{jobKey\}/);
 });
+
+test('auto retry on capacity switch is wired across CreatePage, JobsPage, App, and gpu-api', () => {
+  const createSource = read('pages/CreatePage.tsx');
+  const jobsSource = read('pages/JobsPage.tsx');
+  const appSource = read('App.tsx');
+  const apiSource = read('lib/gpu-api.ts');
+  assert.match(createSource, /auto-retry-capacity/);
+  assert.match(createSource, /无空闲显卡时自动重试/);
+  assert.match(jobsSource, /jobs-auto-retry-capacity/);
+  assert.match(jobsSource, /capacity_retry_message/);
+  assert.match(jobsSource, /停止重试并取消/);
+  assert.match(appSource, /auto_retry_on_capacity/);
+  assert.match(appSource, /retryGpuJob\(id, key, \{ auto_retry_on_capacity: autoRetryOnCapacity \}\)/);
+  assert.match(apiSource, /auto_retry_on_capacity\?: boolean/);
+});

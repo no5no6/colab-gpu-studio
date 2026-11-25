@@ -43,9 +43,13 @@ def test_capacity_is_distinct_from_disappeared_runtime_and_raw_errors_stay_priva
     scheduler._provider = lambda job: SimpleNamespace(inspect=lambda handle: status)
     scheduler._begin_failure = lambda job, code, message: {"code": code, "message": message}
     # _prepare requires a non-empty handle, independently of the provider response.
-    scheduler._lease = lambda job: {"handle": {"runtime_name": "runtimes/owned"}}
+    scheduler._lease = lambda job: {
+        "handle": {"runtime_name": "runtimes/owned"},
+        "requested_spec": {"variant": "VARIANT_GPU", "accelerator": "L4", "shape": "SHAPE_STANDARD"},
+    }
     result = scheduler._prepare({"id": "owned"})
     assert result["code"] == "gpu_capacity_unavailable"
+    assert "上游资源紧缺" in result["message"] and "L4" in result["message"]
     assert "PRIVATE_CREDENTIAL" not in result["message"]
     with pytest.raises(ColabError, match="NO_RUNTIMES") as error:
         GoogleColabProvider._raise_operation_error(operation)
@@ -192,3 +196,193 @@ def test_workflow_sync_uses_workflow_identity_and_deduplicates_shared_drive(monk
     result = main.cloud_sync_workflow(None, "owner", row)
     assert len(result["drive_files"]) == 4
     assert seen == [{"id": "workflow-id", "owner_id": "owner", "account_id": "shared-drive", "drive_account_id": "shared-drive"}]
+
+
+def test_auto_retry_on_capacity_retries_after_cooldown_and_succeeds():
+    from app.gpu.compute import GpuConfig
+    from app.job_schemas import Policy, normalize_policy
+    from app.presenters import public_job
+
+    assert normalize_policy(Policy(auto_retry_on_capacity=True))["auto_retry_on_capacity"] is True
+    repo = Repository(Store("sqlite://"))
+    now = [1000.0]
+    job = repo.create(
+        "jobs",
+        "owner",
+        {
+            "state": "queued",
+            "provider": "mock",
+            "max_runtime_minutes": 10,
+            "execution_policy": {"provider": "mock", "lifecycle": "save", "auto_retry_on_capacity": True},
+        },
+    )
+
+    class FlakyCapacityProvider(MockColabProvider):
+        def __init__(self):
+            super().__init__()
+            self.created_runtime_ids: list[str] = []
+
+        def create(self, spec, request_id, job_id, runtime_id):
+            self.created_runtime_ids.append(runtime_id)
+            return super().create(spec, request_id, job_id, runtime_id)
+
+        def inspect(self, handle):
+            if handle["runtime_id"] == self.created_runtime_ids[0]:
+                return {
+                    "ready": False,
+                    "deleted": True,
+                    "allocation_failed": True,
+                    "allocation_error_code": 9,
+                    "allocation_failure_reason": "NO_RUNTIMES",
+                }
+            return super().inspect(handle)
+
+    provider = FlakyCapacityProvider()
+    executor = MockGPUExecutor()
+    scheduler = Scheduler(
+        repo,
+        provider_factory=lambda j: provider,
+        executor_factory=lambda j: executor,
+        config=GpuConfig(capacity_retry_seconds=20.0),
+        clock=lambda: now[0],
+    )
+    # queued -> validating -> waiting_for_capacity -> allocating -> preparing -> waiting_for_capacity (retry #1)
+    for _ in range(5):
+        scheduler.tick()
+    retrying = repo.get("jobs", job["id"], "owner")
+    assert retrying["state"] == "waiting_for_capacity"
+    assert retrying["capacity_retry_count"] == 1
+    assert retrying["capacity_retry_at"] == 1020.0
+    assert retrying["lease_id"] is None
+    presented = public_job(retrying)
+    assert presented["auto_retry_on_capacity"] is True
+    assert presented["capacity_retry_count"] == 1
+    assert "自动重试" in presented["capacity_retry_message"]
+    assert len(repo.list("instances", "owner")) == 1
+
+    # 冷却时间内不会被重复认领
+    now[0] = 1010.0
+    assert scheduler.tick()["advanced"] is False
+
+    # 冷却结束后使用新租约重试并最终完成
+    now[0] = 1021.0
+    for _ in range(15):
+        scheduler.tick()
+        if repo.get("jobs", job["id"], "owner")["state"] == "completed":
+            break
+    done = repo.get("jobs", job["id"], "owner")
+    assert done["state"] == "completed"
+    assert len(provider.created_runtime_ids) == 2
+    assert provider.created_runtime_ids[0] != provider.created_runtime_ids[1]
+    assert len(repo.list("instances", "owner")) == 1
+    assert repo.list("instances", "owner")[0]["state"] == "deleted"
+
+
+def test_auto_retry_on_capacity_cancels_immediately_and_closes_instance():
+    from app.gpu.compute import GpuConfig
+
+    repo = Repository(Store("sqlite://"))
+    now = [2000.0]
+    job = repo.create(
+        "jobs",
+        "owner",
+        {
+            "state": "queued",
+            "provider": "mock",
+            "max_runtime_minutes": 10,
+            "execution_policy": {"provider": "mock", "lifecycle": "save", "auto_retry_on_capacity": True},
+        },
+    )
+
+    class AlwaysNoRuntimeProvider(MockColabProvider):
+        def inspect(self, handle):
+            return {
+                "ready": False,
+                "deleted": True,
+                "allocation_failed": True,
+                "allocation_error_code": 9,
+                "allocation_failure_reason": "NO_RUNTIMES",
+            }
+
+    scheduler = Scheduler(
+        repo,
+        provider_factory=lambda j: AlwaysNoRuntimeProvider(),
+        executor_factory=lambda j: MockGPUExecutor(),
+        config=GpuConfig(capacity_retry_seconds=20.0),
+        clock=lambda: now[0],
+    )
+    for _ in range(5):
+        scheduler.tick()
+    assert repo.get("jobs", job["id"], "owner")["state"] == "waiting_for_capacity"
+    cancelled = scheduler.cancel("owner", job["id"])
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["capacity_retry_at"] is None
+    assert repo.list("instances", "owner")[0]["state"] == "deleted"
+    now[0] = 2100.0
+    assert scheduler.tick()["advanced"] is False
+    assert repo.get("jobs", job["id"], "owner")["state"] == "cancelled"
+
+
+def test_auto_retry_on_capacity_cleans_up_before_retrying_immediate_error():
+    from app.gpu.compute import GpuConfig
+
+    repo = Repository(Store("sqlite://"))
+    job = repo.create(
+        "jobs",
+        "owner",
+        {
+            "state": "allocating",
+            "provider": "mock",
+            "max_runtime_minutes": 1,
+            "execution_policy": {"provider": "mock", "lifecycle": "save", "auto_retry_on_capacity": True},
+        },
+    )
+
+    class ImmediateNoRuntimeProvider(MockColabProvider):
+        def create(self, *args):
+            raise ColabAllocationError(9, "NO_RUNTIMES")
+
+        def inspect(self, handle):
+            return {"deleted": True, "allocation_failed": True}
+
+    scheduler = Scheduler(
+        repo,
+        provider_factory=lambda j: ImmediateNoRuntimeProvider(),
+        config=GpuConfig(capacity_retry_seconds=15.0),
+    )
+    cleaning = scheduler._allocation(job)
+    assert cleaning["state"] == "cleaning_up"
+    assert cleaning["capacity_retry_pending"] is True
+    retrying = scheduler._cleanup(cleaning)
+    assert retrying["state"] == "waiting_for_capacity"
+    assert retrying["capacity_retry_count"] == 1
+    assert repo.list("leases", "owner")[0]["state"] == "deleted"
+
+
+def test_instance_retention_syncs_state_and_deadline_to_running_job():
+    from app.gpu.instances import InstanceService
+    from app.presenters import public_job
+
+    repo = Repository(Store("sqlite://"))
+    job = repo.create(
+        "jobs",
+        "owner",
+        {
+            "state": "running",
+            "provider": "mock",
+            "max_runtime_minutes": 10,
+            "execution_policy": {"provider": "mock", "lifecycle": "save"},
+        },
+    )
+    service = InstanceService(repo, clock=lambda: 5000.0)
+    instance = service.allocate(job)
+    service.mark_ready({**job, "instance_id": instance["id"]})
+    service.job_busy({**job, "instance_id": instance["id"]})
+
+    updated = service.retention("owner", instance["id"], "retain", 15, "retain-key-1")
+    assert updated["state"] == "retained_idle"
+    assert updated["retained_until"] == 5900.0
+
+    synced_job = public_job(repo.get("jobs", job["id"], "owner"))
+    assert synced_job["instance_state"] == "retained_idle"
+    assert synced_job["retained_until"] == 5900.0

@@ -40,6 +40,7 @@ class GpuConfig:
     create_timeout_seconds: float = 30.0
     cleanup_retry_base_seconds: float = 2.0
     cleanup_retry_max_seconds: float = 300.0
+    capacity_retry_seconds: float = 20.0
     claim_ttl_seconds: float = 120.0
     # Trusted executor plugins are administrator-only and fail closed unless
     # explicitly enabled with an exact module:entrypoint@version allowlist.
@@ -90,6 +91,7 @@ class GpuConfig:
             create_timeout_seconds=cls._number("GPU_CREATE_TIMEOUT_SECONDS", 30),
             cleanup_retry_base_seconds=max(0.0, cls._number("GPU_CLEANUP_RETRY_BASE_SECONDS", 2)),
             cleanup_retry_max_seconds=max(0.0, cls._number("GPU_CLEANUP_RETRY_MAX_SECONDS", 300)),
+            capacity_retry_seconds=max(0.0, cls._number("GPU_CAPACITY_RETRY_SECONDS", 20)),
             claim_ttl_seconds=max(1.0, cls._number("GPU_CLAIM_TTL_SECONDS", 120)),
             trusted_executor_enabled=cls._bool("GPU_TRUSTED_EXECUTOR_ENABLED", False),
             trusted_executor_type=os.getenv("GPU_TRUSTED_EXECUTOR_TYPE", "trusted").strip(),

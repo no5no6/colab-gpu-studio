@@ -13,6 +13,8 @@ export interface GpuExecutionPolicyV020 {
   instance_id?: string | null;
   lifecycle?: GpuLifecycle;
   retain_idle_minutes?: number | null;
+  /** 无空闲 GPU（NO_RUNTIMES）时是否由后端调度器自动间隔重试 */
+  auto_retry_on_capacity?: boolean;
   /** Legacy fields: when present, the server validates them against lifecycle. */
   shutdown_after_job?: boolean;
   idle_grace_minutes?: number;
@@ -111,8 +113,8 @@ export interface GpuInstance {
   version?: number;
   idle_minutes?: number | null;
   retain_requested_at?: string | null;
-  idle_deadline_at?: string | null;
-  hard_deadline_at?: string | null;
+  idle_deadline_at?: string | number | null;
+  hard_deadline_at?: string | number | null;
   manual_stop_requested?: boolean;
   current_job_id?: string | null;
   gpu_reported?: string | null;
@@ -120,7 +122,7 @@ export interface GpuInstance {
   runtime_spec_reported?: Record<string, unknown> | null;
   created_at?: string;
   last_seen_at?: string | null;
-  retained_until?: string | null;
+  retained_until?: string | number | null;
   estimated_units?: number | null;
   actual_units?: number | null;
   runtime_deleted?: boolean;
@@ -184,8 +186,16 @@ export interface GpuJobSafetyFields {
   instance_label?: string | null;
   instance_state?: GpuInstanceState | null;
   gpu_reported?: string | null;
-  retained_until?: string | null;
+  retained_until?: string | number | null;
   runtime_deleted?: boolean | null;
   stage?: string | null;
   actual_units?: number | null;
+  /** 是否开启无空闲 GPU 自动重试 */
+  auto_retry_on_capacity?: boolean;
+  /** 无空闲 GPU 自动重试已触发次数 */
+  capacity_retry_count?: number;
+  /** 下次自动重试的时间戳（秒） */
+  capacity_retry_at?: number | null;
+  /** 当前自动重试等待说明文案 */
+  capacity_retry_message?: string | null;
 }

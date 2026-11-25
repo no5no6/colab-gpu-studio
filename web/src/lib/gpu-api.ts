@@ -74,9 +74,17 @@ export interface GpuJob {
   instance_state?: string | null;
   gpu_reported?: string | null;
   runtime_spec_requested?: { accelerator?: string; variant?: string; shape?: string } | null;
-  retained_until?: string | null;
+  retained_until?: string | number | null;
   runtime_deleted?: boolean | null;
   stage?: string | null;
+  /** 是否开启无空闲 GPU 自动重试 */
+  auto_retry_on_capacity?: boolean;
+  /** 无空闲 GPU 自动重试已触发次数 */
+  capacity_retry_count?: number;
+  /** 下次自动重试的时间戳（秒） */
+  capacity_retry_at?: number | null;
+  /** 当前自动重试等待说明文案 */
+  capacity_retry_message?: string | null;
   created_at?: string;
   updated_at?: string;
   events?: GpuEvent[];
@@ -248,7 +256,15 @@ export async function createGpuJob(body: GpuJobRequest, idempotencyKey: string):
 export const getGpuJobs = (projectId: string) => apiFetch<GpuJob[]>(`/api/gpu/jobs?project_id=${encodeURIComponent(projectId)}`);
 export const getGpuJob = (id: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}`);
 export const cancelGpuJob = (id: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/cancel`, post({}));
-export const retryGpuJob = (id: string, idempotencyKey: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify({}) });
+export const retryGpuJob = (
+  id: string,
+  idempotencyKey: string,
+  options?: { auto_retry_on_capacity?: boolean },
+) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/retry`, {
+  method: 'POST',
+  headers: { 'Idempotency-Key': idempotencyKey },
+  body: JSON.stringify(options ?? {}),
+});
 export const getGpuGallery = (projectId: string) => apiFetch<GalleryAsset[]>(`/api/gpu/gallery?project_id=${encodeURIComponent(projectId)}`);
 export const getGpuUsage = () => apiFetch<GpuUsage>('/api/gpu/usage');
 export const getGpuSettings = () => apiFetch<GpuSettings>('/api/gpu/settings');

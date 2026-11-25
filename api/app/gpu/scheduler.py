@@ -387,6 +387,28 @@ class Scheduler:
         instance = self._instance_call("mark_deleted", job.get("owner_id"), job["instance_id"], confirmed=True)
         return self._merge_instance(job, instance)
 
+    @staticmethod
+    def _auto_retry_on_capacity(job: dict) -> bool:
+        policy = job.get("execution_policy") or {}
+        return bool(policy.get("auto_retry_on_capacity") or job.get("auto_retry_on_capacity"))
+
+    def _close_cancelled_unleased_instance(self, job: dict) -> dict:
+        """取消无活动租约的任务（如无卡自动重试等待中）时，立即关闭已占用的分配中实例。"""
+        if not self._is_v020_job(job) or not job.get("instance_id"):
+            return job
+        instance = self._service_instance_for_job(job)
+        if not instance or instance.get("state") == "deleted":
+            return job
+        try:
+            if instance.get("state") != "releasing":
+                job, _ = self._complete_instance(job, False)
+            closed = self._instance_call(
+                "mark_deleted", job.get("owner_id"), job["instance_id"], confirmed=True
+            )
+            return self._merge_instance(job, closed)
+        except SchedulerError:
+            return job
+
     def _factory(self, factory: Callable, job: dict):
         """Injected adapters take ``job`` and optionally the base Store."""
         import inspect
@@ -625,9 +647,10 @@ class Scheduler:
         if job.get("lease_id"):
             lease=self._get("leases", job["lease_id"], job.get("owner_id"))
             return lease if lease and lease.get('owner_job_id')==job['id'] else None
+        skip_deleted = bool(job.get("attempt_retry_keys") or job.get("capacity_retry_count"))
         return next(
             (x for x in self._leases_for(job.get("owner_id")) if x.get("owner_job_id") == job["id"]
-             and not (job.get('attempt_retry_keys') and x.get('state')=='deleted')), None
+             and not (skip_deleted and x.get("state") == "deleted")), None
         )
 
     def _ensure_lease(self, job: dict) -> dict:
@@ -914,9 +937,73 @@ class Scheduler:
             job, "failed", message, requested_outcome="failed", error_code=code, error_message=message
         )
 
-    def _allocation_failed(self, job: dict, exc: ColabAllocationError) -> dict:
+    def _schedule_capacity_retry(self, job: dict, reason_message: str) -> dict:
+        """将无空闲 GPU 的任务退回 waiting_for_capacity，等待冷却后重新申请新租约。"""
+        retry_count = int(job.get("capacity_retry_count") or 0) + 1
+        delay = max(0.0, float(self.config.capacity_retry_seconds))
+        retry_at = self.clock() + delay
+        wait_text = f"{int(round(delay))} 秒后自动重试" if delay > 0 else "即将自动重试"
+        message = f"{reason_message}；{wait_text}（第 {retry_count} 次），点击「取消」停止"
+        return self._set_state(
+            job,
+            "waiting_for_capacity",
+            message,
+            lease_id=None,
+            request_id=None,
+            runtime_id=None,
+            deadline_epoch=None,
+            started_epoch=None,
+            started_at=None,
+            error_code=None,
+            error_message=None,
+            cleanup_final_state=None,
+            requested_outcome=None,
+            cleanup_next_epoch=0,
+            capacity_retry_pending=False,
+            capacity_retry_count=retry_count,
+            capacity_retry_at=retry_at,
+            capacity_retry_message=message,
+        )
+
+    def _allocation_failed(self, job: dict, exc: ColabAllocationError, *, runtime_absent: bool = False) -> dict:
         code = "gpu_capacity_unavailable" if exc.reason == "NO_RUNTIMES" else "gpu_allocation_failed"
-        return self._begin_failure(job, code, str(exc))
+        message = str(exc)
+        base_capacity_message = "Colab 上游资源紧缺，当前没有空闲显卡可分配（NO_RUNTIMES）"
+        if exc.reason == "NO_RUNTIMES":
+            lease = self._lease(job) or {}
+            spec = lease.get("requested_spec") or (lease.get("selected_spec") or {}).get("key") or {}
+            accelerator = str(spec.get("accelerator") or "").strip().upper()
+            if accelerator and accelerator != "NONE":
+                base_capacity_message = f"Colab 上游资源紧缺，当前没有空闲 {accelerator} 显卡可分配（NO_RUNTIMES）"
+            message = f"{base_capacity_message}；请稍后重试"
+            if self._auto_retry_on_capacity(job) and not job.get("cancel_requested"):
+                if lease and runtime_absent:
+                    self._update(
+                        "leases",
+                        lease["id"],
+                        {
+                            "state": "deleted",
+                            "last_seen": self.clock(),
+                            "remote_deleted": True,
+                            "remote_deleted_at": self.clock(),
+                            "remote_delete_source": "capacity_retry_absent",
+                        },
+                        job.get("owner_id"),
+                    )
+                    return self._schedule_capacity_retry(job, base_capacity_message)
+                if not lease:
+                    return self._schedule_capacity_retry(job, base_capacity_message)
+                return self._set_state(
+                    job,
+                    "cleaning_up",
+                    f"{base_capacity_message}；正在确认远端释放后自动重试",
+                    cleanup_final_state="waiting_for_capacity",
+                    capacity_retry_pending=True,
+                    capacity_retry_message=base_capacity_message,
+                    error_code=None,
+                    error_message=None,
+                )
+        return self._begin_failure(job, code, message)
 
     def _expired(self, job: dict) -> bool:
         lease = self._lease(job)
@@ -932,13 +1019,25 @@ class Scheduler:
         except Exception as exc:
             return self._begin_failure(job, "gpu_runtime_inspect_failed", self._safe_error(exc))
         if status.get("allocation_failed"):
-            return self._allocation_failed(job, ColabAllocationError(
-                status.get("allocation_error_code"), status.get("allocation_failure_reason")))
+            return self._allocation_failed(
+                job,
+                ColabAllocationError(
+                    status.get("allocation_error_code"), status.get("allocation_failure_reason")
+                ),
+                runtime_absent=bool(status.get("deleted")),
+            )
         if status.get("deleted"):
             return self._begin_failure(job, "gpu_runtime_missing", "GPU runtime disappeared")
         if status.get("ready"):
             job = self._mark_instance("mark_ready", job)
-            return self._set_state(job, "loading", "GPU runtime is ready")
+            return self._set_state(
+                job,
+                "loading",
+                "GPU runtime is ready",
+                capacity_retry_at=None,
+                capacity_retry_message=None,
+                capacity_retry_pending=False,
+            )
         return job
 
     def _load(self, job: dict) -> dict:
@@ -1325,6 +1424,8 @@ class Scheduler:
             "gpu_cleanup_pending", "gpu_instance_completion_pending",
         }:
             patch.update(error_code=None, error_message=None)
+        patch.setdefault("capacity_retry_at", None)
+        patch.setdefault("capacity_retry_pending", False)
         return self._set_state(job, state, message, cleanup_next_epoch=0, **patch)
 
     def _cleanup(self, job: dict) -> dict:
@@ -1344,8 +1445,13 @@ class Scheduler:
                 if transferred:
                     self._event(job,'completed','Mock outputs verified; lease reused')
                     return self._get('jobs',job['id'],job['owner_id'])
-        final_state = job.get("cleanup_final_state") or job.get("requested_outcome") or "failed"
-        if self._is_v020_job(job) and job.get("instance_id"):
+        retrying_capacity = bool(job.get("capacity_retry_pending")) and not job.get("cancel_requested")
+        final_state = (
+            "cancelled"
+            if job.get("cancel_requested")
+            else (job.get("cleanup_final_state") or job.get("requested_outcome") or "failed")
+        )
+        if not retrying_capacity and self._is_v020_job(job) and job.get("instance_id"):
             try:
                 job, instance = self._complete_instance(job, final_state == "completed")
             except SchedulerError as exc:
@@ -1393,8 +1499,16 @@ class Scheduler:
                     self._update('executions',job['execution_id'],{'state':'completed','finished_at':self.clock()},job['owner_id'])
                 return self._set_state(job,'completed','Mock outputs verified; idle lease retained')
         if not lease:
+            if retrying_capacity:
+                return self._schedule_capacity_retry(
+                    job, job.get("capacity_retry_message") or "Colab 上游资源紧缺，当前没有空闲显卡可分配（NO_RUNTIMES）"
+                )
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         if lease.get("state") == "deleted":
+            if retrying_capacity:
+                return self._schedule_capacity_retry(
+                    job, job.get("capacity_retry_message") or "Colab 上游资源紧缺，当前没有空闲显卡可分配（NO_RUNTIMES）"
+                )
             job = self._close_unstarted_instance(job, lease)
             self._record_usage(job, lease, self.clock())
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
@@ -1429,7 +1543,7 @@ class Scheduler:
         except Exception as exc:
             confirmed, error = False, self._safe_error(exc)
         attempts = int(lease.get("delete_attempts") or 0) + 1
-        if confirmed:
+        if confirmed and not retrying_capacity:
             try:
                 job = self._mark_instance_deleted(job)
             except SchedulerError as exc:
@@ -1465,9 +1579,13 @@ class Scheduler:
             lease["id"],
             {"state": "deleted", "delete_attempts": attempts, "last_seen": self.clock(),
              "remote_deleted": True, "remote_deleted_at": self.clock(),
-             "remote_delete_source": "cleanup_provider_confirmation"},
+             "remote_delete_source": "capacity_retry_cleanup" if retrying_capacity else "cleanup_provider_confirmation"},
             job.get("owner_id"),
         )
+        if retrying_capacity:
+            return self._schedule_capacity_retry(
+                job, job.get("capacity_retry_message") or "Colab 上游资源紧缺，当前没有空闲显卡可分配（NO_RUNTIMES）"
+            )
         self._record_usage(job, lease, self.clock())
         return self._finish_cleanup(job, final_state, "GPU cleanup completed")
 
@@ -1483,9 +1601,19 @@ class Scheduler:
                     "GPU cancellation requested",
                     requested_outcome="cancelled",
                     cleanup_final_state="cancelled",
+                    capacity_retry_pending=False,
+                    capacity_retry_at=None,
                 )
             else:
-                return self._set_state(job, "cancelled", "GPU job cancelled", requested_outcome="cancelled")
+                job = self._close_cancelled_unleased_instance(job)
+                return self._set_state(
+                    job,
+                    "cancelled",
+                    "GPU job cancelled",
+                    requested_outcome="cancelled",
+                    capacity_retry_pending=False,
+                    capacity_retry_at=None,
+                )
         if job.get("state") == "cleanup_pending":
             return self._cleanup(job)
         if self._expired(job) and job.get("state") not in {
@@ -1502,6 +1630,9 @@ class Scheduler:
         if state == "validating":
             return self._validate(job)
         if state == "waiting_for_capacity":
+            retry_at = job.get("capacity_retry_at")
+            if retry_at is not None and self.clock() < float(retry_at):
+                return job
             # CPU cache preparation owns the first wait.  Do not allocate a
             # durable/runtime instance until the prep decision is settled.
             if self._await_prep(job):
@@ -1523,7 +1654,9 @@ class Scheduler:
                             break
             if not self._is_v020_job(job) and self._has_capacity_blocker(job):
                 return job
-            return self._set_state(job, "allocating", "GPU capacity available", awaiting_prep=False)
+            retry_count = int(job.get("capacity_retry_count") or 0)
+            msg = f"开始第 {retry_count} 次自动重试分配 GPU" if retry_count > 0 else "GPU capacity available"
+            return self._set_state(job, "allocating", msg, awaiting_prep=False, capacity_retry_at=None)
         if state == "allocating":
             return self._allocation(job)
         if state == "preparing":
@@ -1550,6 +1683,13 @@ class Scheduler:
         )
         for job in jobs:
             if job.get("state") not in ACTIVE_STATES:
+                continue
+            if (
+                job.get("state") == "waiting_for_capacity"
+                and not job.get("cancel_requested")
+                and job.get("capacity_retry_at") is not None
+                and float(job.get("capacity_retry_at")) > now
+            ):
                 continue
             until = float(job.get("claim_until") or 0)
             if job.get("claim_token") and until > now:
@@ -1951,9 +2091,16 @@ class Scheduler:
             raise KeyError(job_id)
         if job.get("state") in TERMINAL_STATES:
             return job
-        if job.get("state") == "queued" and not self._lease(job):
+        if job.get("state") in {"queued", "waiting_for_capacity"} and not self._lease(job):
+            job = self._close_cancelled_unleased_instance(job)
             return self._set_state(
-                job, "cancelled", "GPU job cancelled", cancel_requested=True, requested_outcome="cancelled"
+                job,
+                "cancelled",
+                "GPU job cancelled",
+                cancel_requested=True,
+                requested_outcome="cancelled",
+                capacity_retry_pending=False,
+                capacity_retry_at=None,
             )
         return self._update(
             "jobs", job_id, {"cancel_requested": True, "requested_outcome": "cancelled"}, owner_id
